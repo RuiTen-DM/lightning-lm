@@ -91,6 +91,11 @@ lidar_loc:
   grid_search_angle_step: 60
   lidar_loc_odom_th: 0.5
   init_with_fp: true
+  # 重定位初值（地图系）：[x, y, z, roll, pitch, yaw]，单位 m 和度。地图匹配得分超过 min_init_confidence 才采用
+  # 失败后过 2 秒或移动后再试，最多 5 次。若 init_with_fp 为 true，还会依次尝试地图功能点（建图起点 start、上次退出处 recover）
+  init_pose_enable: false
+  init_pose: [ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ]
+  init_pose_search_yaw: false  # 朝向不确定时打开，以 init_pose 的 yaw 为中心按 grid_search_angle_* 搜索
   min_init_confidence: 1.8
   update_dynamic_cloud: false
   update_err_h: 0.2

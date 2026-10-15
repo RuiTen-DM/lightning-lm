@@ -6,6 +6,8 @@
 
 #include <opencv2/highgui.hpp>
 
+#include "common/constant.h"
+#include "core/lightning_math.hpp"
 #include "core/localization/pose_graph/pgo.h"
 #include "io/yaml_io.h"
 #include "ui/pangolin_window.h"
@@ -55,6 +57,29 @@ bool Localization::Init(const std::string& yaml_path, const std::string& global_
     }
 
     lidar_loc_->Init(yaml_path);
+
+    /// 配置文件给出的重定位初值
+    if (yaml.HasValue("lidar_loc", "init_pose_enable") && yaml.GetValue<bool>("lidar_loc", "init_pose_enable")) {
+        auto v = yaml.GetValue<std::vector<double>>("lidar_loc", "init_pose");
+        if (v.size() == 6) {
+            using constant::kDEG2RAD;
+            SE3 pose = math::XYZRPYToSE3(PoseRPYD(v[0], v[1], v[2], v[3] * kDEG2RAD, v[4] * kDEG2RAD, v[5] * kDEG2RAD));
+            bool search_yaw = yaml.HasValue("lidar_loc", "init_pose_search_yaw") &&
+                              yaml.GetValue<bool>("lidar_loc", "init_pose_search_yaw");
+            bool rp_from_gravity = yaml.HasValue("lidar_loc", "init_pose_rp_from_gravity") &&
+                                   yaml.GetValue<bool>("lidar_loc", "init_pose_rp_from_gravity");
+            // LIO 没有重力对齐时，它的姿态是相对开机时 IMU 的，不能当作地图系下的 roll/pitch
+            bool gravity_align =
+                yaml.HasValue("fasterlio", "gravity_align") && yaml.GetValue<bool>("fasterlio", "gravity_align");
+            if (rp_from_gravity && !gravity_align) {
+                LOG(WARNING) << "init_pose_rp_from_gravity needs fasterlio/gravity_align, use roll/pitch in init_pose";
+                rp_from_gravity = false;
+            }
+            lidar_loc_->SetInitialPose(RelocGuess(pose, "config pose", search_yaw, rp_from_gravity));
+        } else {
+            LOG(ERROR) << "lidar_loc/init_pose should be [x, y, z, roll, pitch, yaw], got " << v.size() << " values";
+        }
+    }
 
     /// pose graph
     pgo_ = std::make_shared<PGO>();
@@ -338,11 +363,10 @@ void Localization::Finish() {
     lidar_odom_proc_cloud_.Quit();
 }
 
-void Localization::SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t) {
+void Localization::SetExternalPose(const RelocGuess& guess) {
     UL lock(global_mutex_);
-    /// 设置外部重定位的pose
     if (lidar_loc_) {
-        lidar_loc_->SetInitialPose(SE3(q, t));
+        lidar_loc_->SetInitialPose(guess);
     }
 }
 

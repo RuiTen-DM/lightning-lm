@@ -162,7 +162,7 @@ Ubuntu 20.04 应该也可行，未测试。
 
 1. 实时定位
     - 将地图路径写到yaml中的 system-map_path 下，默认是new_map（和建图默认一致)
-    - 将车放在建图起点处
+    - 将车放在建图起点处，或在 yaml 的 lidar_loc 下打开 init_pose_enable，用 init_pose 指定初始位姿（[x, y, z, roll, pitch, yaw]，单位 m 和度；朝向不确定时打开 init_pose_search_yaw）。初始位姿需经地图匹配验证，得分超过 min_init_confidence 才采用
     - 启动定位程序：
       ```ros2 run lightning run_loc_online --config ./config/default_nclt.yaml```
     - 播包或者输入传感器数据即可

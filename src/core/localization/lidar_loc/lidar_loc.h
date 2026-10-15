@@ -4,12 +4,14 @@
 #include <chrono>
 #include <deque>
 #include <iostream>
+#include <optional>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <thread>
 
 #include "common/nav_state.h"
 #include "common/timed_pose.h"
 #include "core/localization/localization_result.h"
+#include "core/localization/reloc_guess.h"
 #include "core/maps/tiled_map.h"
 
 #include "pclomp/ndt_omp_impl.hpp"
@@ -42,6 +44,7 @@ class LidarLoc {
         bool force_2d_ = true;                         // 强制在2D空间
         float min_init_confidence_ = 0.1;              // 初始化时要求的最小分值
         bool init_with_fp_ = true;                     // 是否使用功能点进行初始化
+        int max_reloc_guess_tries_ = 5;                // 重定位初值最多尝试几次，之后丢弃
         bool enable_parking_static_ = false;           // 是否在静止时输出固定位置
         bool enable_icp_adjust_ = false;               // 是否使用icp调整ndt匹配结果提高定位精度
 
@@ -94,8 +97,8 @@ class LidarLoc {
      */
     bool TryOtherSolution(CloudPtr input, SE3& pose);
 
-    /// 使用功能点初始化
-    bool InitWithFP(CloudPtr input, const SE3& fp_pose);
+    /// 以给定初值做地图匹配来初始化，得分超过 min_init_confidence 才算成功
+    bool InitWithGuess(CloudPtr input, const RelocGuess& guess);
 
     /// 更新全局地图
     bool UpdateGlobalMap();
@@ -120,8 +123,11 @@ class LidarLoc {
     /// 设置UI
     void SetUI(std::shared_ptr<ui::PangolinWindow> ui) { ui_ = ui; }
 
-    /// 设置init pose
-    void SetInitialPose(SE3 init_pose);
+    /**
+     * 设置重定位初值，下一帧以它重新初始化，新的初值会替换旧的
+     * 失败后会重试，最多 max_reloc_guess_tries_ 次；若 init_with_fp 打开，还会继续尝试地图功能点
+     */
+    void SetInitialPose(const RelocGuess& guess);
 
     /// 获取定位结果
     LocalizationResult GetLocalizationResult() {
@@ -157,6 +163,15 @@ class LidarLoc {
     bool AssignDRPose(double timestamp);
 
     /**
+     * 尝试初始化：先试重定位初值，再试地图功能点
+     * 失败后要等一段时间或移动一段距离才再试
+     */
+    bool TryInit(CloudPtr input, double current_time);
+
+    /// 载入 pose 附近的地图，若有新区块载入，则立即更新匹配目标
+    void LoadMapAt(const SE3& pose);
+
+    /**
      * 检查车辆是否静止
      * @param timestamp
      * @return
@@ -179,6 +194,9 @@ class LidarLoc {
      */
     bool YawSearch(SE3& pose, double& confidence, CloudPtr input, CloudPtr output);
 
+    /// 初始化用的配准：先粗后细，多迭代几轮，得分超过 min_init_confidence 才算成功
+    bool LocalizeForInit(SE3& pose, double& confidence, CloudPtr input, CloudPtr output);
+
     bool CheckLidarOdomValid(const SE3& current_pose_esti, double& delta_posi);
 
     // 成员变量  ==========================================================================
@@ -197,10 +215,13 @@ class LidarLoc {
     std::shared_ptr<ui::PangolinWindow> ui_ = nullptr;  // ui
     SE3 last_loc_pose_;
 
-    std::mutex initial_pose_mutex_;  // 初始定位锁
-    bool initial_pose_set_ = false;  // 定位是否被手动设置
-    SE3 initial_pose_;               // 手动设置的初始位姿
-    bool loc_inited_ = false;        // 定位是否初始化成功
+    std::mutex reloc_guess_mutex_;           // 重定位初值锁
+    std::optional<RelocGuess> reloc_guess_;  // 待验证的重定位初值，初始化成功或多次失败后清除
+    bool reloc_guess_updated_ = false;       // 收到新的重定位初值，需要重新初始化
+    bool reloc_guess_lo_set_ = false;        // 是否已记录初值对应的 LO 位姿
+    SE3 reloc_guess_lo_pose_;                // 初值对应的 LO 位姿，重试时据此把初值递推到当前帧
+    int reloc_guess_tries_ = 0;              // 当前初值已失败的次数
+    bool loc_inited_ = false;                // 定位是否初始化成功
 
     double current_timestamp_ = 0;  // 本次输入的时间戳
     double last_timestamp_ = 0;     // 上次输入的时间戳
@@ -251,9 +272,10 @@ class LidarLoc {
     std::mutex dr_pose_mutex_;
     std::deque<NavState> dr_pose_queue_;
 
-    /// 功能点初始化的记录
-    std::vector<SE3> fp_init_fail_pose_vec_;
-    double fp_last_tried_time_ = 0;
+    /// 初始化失败的记录
+    bool init_failed_ = false;
+    double init_fail_time_ = 0;
+    SE3 init_fail_dr_pose_;
 
     bool update_map_quit_ = false;
     std::thread update_map_thread_;            // 地图更新

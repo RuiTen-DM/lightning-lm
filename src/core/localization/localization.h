@@ -6,6 +6,7 @@
 #include "common/imu.h"
 #include "core/lio/laser_mapping.h"
 #include "core/localization/localization_result.h"
+#include "core/localization/reloc_guess.h"
 #include "core/system/async_message_process.h"
 
 /// 预声明
@@ -61,8 +62,8 @@ class Localization {
 
     // void ProcessOdomMsg(const nav_msgs::msg::Odometry::SharedPtr odom_msg) override;
 
-    /// 由外部设置pose，适用于手动重定位
-    void SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t);
+    /// 设置重定位初值（手动指定，或 ScanContext、ICP、GNSS 等模块给出），激光定位会以它重新初始化
+    void SetExternalPose(const RelocGuess& guess);
 
     /// TODO: 其他初始化逻辑
 

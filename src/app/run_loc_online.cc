@@ -25,12 +25,11 @@ int main(int argc, char** argv) {
     LocSystem::Options opt;
     LocSystem loc(opt);
 
+    /// 初始位姿来自配置里的 lidar_loc/init_pose，以及地图功能点（建图起点、上次退出处）
     if (!loc.Init(FLAGS_config)) {
         LOG(ERROR) << "failed to init loc";
     }
 
-    /// 默认起点开始定位
-    loc.SetInitPose(SE3());
     loc.Spin();
 
     rclcpp::shutdown();

@@ -67,12 +67,14 @@ void PointCloudPreprocess::Process(const livox_ros_driver2::msg::CustomMsg::Shar
             return;
         }
 
-        if ((abs(cloud_full_[i].x - cloud_full_[i - 1].x) > 1e-7) ||
-            (abs(cloud_full_[i].y - cloud_full_[i - 1].y) > 1e-7) ||
-            (abs(cloud_full_[i].z - cloud_full_[i - 1].z) > 1e-7) &&
-                (cloud_full_[i].x * cloud_full_[i].x + cloud_full_[i].y * cloud_full_[i].y +
-                     cloud_full_[i].z * cloud_full_[i].z >
-                 (blind_ * blind_))) {
+        // 去掉与前一个点重合的点和盲区内的点（如无回波时的零点）
+        // 前一个点要从 msg 里取，cloud_full_[i - 1] 可能没有被写入，或者正被其他线程写入
+        const auto &pre = msg->points[i - 1];
+        bool same_as_pre = abs(msg->points[i].x - pre.x) <= 1e-7 && abs(msg->points[i].y - pre.y) <= 1e-7 &&
+                           abs(msg->points[i].z - pre.z) <= 1e-7;
+        if (!same_as_pre && cloud_full_[i].x * cloud_full_[i].x + cloud_full_[i].y * cloud_full_[i].y +
+                                    cloud_full_[i].z * cloud_full_[i].z >
+                                (blind_ * blind_)) {
             is_valid_pt[i] = 1;
         }
 

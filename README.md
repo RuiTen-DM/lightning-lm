@@ -184,7 +184,7 @@ Original dataset addresses:
 1. Real-time localization
     - Write the map path to `system.map_path` in the yaml file, default is `new_map` (consistent with the mapping
       default).
-    - Place the vehicle at the mapping starting point.
+    - Place the vehicle at the mapping starting point, or set `init_pose_enable` under `lidar_loc` in the yaml and give the initial pose in `init_pose` (`[x, y, z, roll, pitch, yaw]`, meters and degrees; enable `init_pose_search_yaw` if the heading is unknown). The pose is accepted only if the map matching score exceeds `min_init_confidence`.
     - Start the localization program:
       ```ros2 run lightning run_loc_online --config ./config/default_nclt.yaml```
     - Play the bag or input sensor data.

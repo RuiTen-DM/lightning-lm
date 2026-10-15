@@ -15,6 +15,7 @@
 #include "common/eigen_types.h"
 #include "common/imu.h"
 #include "common/keyframe.h"
+#include "core/localization/reloc_guess.h"
 
 namespace lightning {
 
@@ -34,8 +35,8 @@ class LocSystem {
     /// 初始化，地图路径在yaml里配置
     bool Init(const std::string& yaml_path);
 
-    /// 设置初始化位姿
-    void SetInitPose(const SE3& pose);
+    /// 设置重定位初值，配置文件里的 init_pose 已在 Init 中设置
+    void SetInitPose(const loc::RelocGuess& guess);
 
     /// 处理IMU
     void ProcessIMU(const lightning::IMUPtr& imu);

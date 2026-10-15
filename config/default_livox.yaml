@@ -29,11 +29,12 @@ fasterlio:
   b_acc_cov: 0.0001
   b_gyr_cov: 0.0001
   extrinsic_est_en: false      # true: enable the online estimation of IMU-LiDAR extrinsic
-  extrinsic_T: [ 0, 0, 0.28 ]
+  extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
   extrinsic_R: [ 1, 0, 0,
                  0, 1, 0,
                  0, 0, 1 ]
   keep_first_imu_estimation: false
+  gravity_align: true # 用起步静止时的加计均值把重力对齐到地图 -Z 轴，航向沿 IMU x 轴；false 时地图系即初始 IMU 系
   kf_dis_th: 1.0
   kf_angle_th: 10.0
 
@@ -91,7 +92,15 @@ lidar_loc:
   grid_search_angle_step: 60
   lidar_loc_odom_th: 0.5
   init_with_fp: true
-  min_init_confidence: 1.8
+  # 重定位初值（地图系）：[x, y, z, roll, pitch, yaw]，单位 m 和度。地图匹配得分超过 min_init_confidence 才采用
+  # 失败后过 2 秒或移动后再试，最多 5 次。若 init_with_fp 为 true，还会依次尝试地图功能点（建图起点 start、上次退出处 recover）
+  init_pose_enable: false
+  init_pose: [ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ]
+  init_pose_search_yaw: false  # 朝向不确定时打开，以 init_pose 的 yaw 为中心按 grid_search_angle_* 搜索
+  # 打开时忽略 init_pose 的 roll/pitch，改用 LIO 起步时重力对齐得到的姿态，yaw 仍取 init_pose（IMU x 轴在地图中的朝向）
+  # 需要 fasterlio/gravity_align 为 true，且地图也是重力对齐建的
+  init_pose_rp_from_gravity: true
+  min_init_confidence: 2.5  # 本数据收敛时约 2.9~3.0，走廊里错 1.5 m 的伪解约 2.3，错误位置 <= 1.85
   update_dynamic_cloud: false
   update_err_h: 0.2
   update_err_v: 0.2
@@ -128,8 +137,8 @@ pgo:
   rtk_outlier_th: 1.0
   smooth_factor: 0.01
 roi:
-  height_max: 10.0
-  height_min: 0.5
+  height_max: 50.0
+  height_min: -5.0
   range_max: 70
   range_min: 3.0
 ui:

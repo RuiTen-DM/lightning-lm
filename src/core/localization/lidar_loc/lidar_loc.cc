@@ -263,15 +263,10 @@ bool LidarLoc::YawSearch(SE3& pose, double& confidence, CloudPtr input, CloudPtr
 
     // find best match
     auto best_score_idx = std::max_element(scores.begin(), scores.end()) - scores.begin();
-    confidence = scores.at(best_score_idx);
     pose = pose_opti.at(best_score_idx);
 
-    /// 高分辨率
-    if (confidence > options_.min_init_confidence_) {
-        Localize(pose, confidence, input, output, false);
-    }
-
-    if (confidence > options_.min_init_confidence_) {
+    /// 从最佳朝向开始精配准。粗分辨率的得分和阈值不是一个量级，不用它判断
+    if (LocalizeForInit(pose, confidence, input, output)) {
         LOG(INFO) << "init success, score: " << confidence << ", th=" << options_.min_init_confidence_;
         Eigen::Vector3d suc_translation = pose.translation();
         Eigen::Matrix3d suc_rotation_matrix = pose.rotationMatrix();
@@ -286,15 +281,21 @@ bool LidarLoc::YawSearch(SE3& pose, double& confidence, CloudPtr input, CloudPtr
     return yaw_search_success;
 }
 
-bool LidarLoc::InitWithFP(CloudPtr input, const SE3& fp_pose) {
+bool LidarLoc::InitWithGuess(CloudPtr input, const RelocGuess& guess) {
     assert(input != nullptr && !input->empty());
 
-    // 使用功能点的位置进行定位初始化
-    double fitness_score;
-    SE3 pose_esti = fp_pose;
+    LOG(INFO) << "try init with " << guess.source_ << ": " << guess.pose_.translation().transpose()
+              << ", search yaw: " << guess.search_yaw_;
+    LoadMapAt(guess.pose_);
+
+    double fitness_score = 0;
+    SE3 pose_esti = guess.pose_;
     CloudPtr output_cloud(new PointCloudType);
-    // loc_inited_ = YawSearch(pose_esti, fitness_score, input, output_cloud);
-    loc_inited_ = Localize(pose_esti, fitness_score, input, output_cloud);
+    if (guess.search_yaw_) {
+        loc_inited_ = YawSearch(pose_esti, fitness_score, input, output_cloud);
+    } else {
+        loc_inited_ = LocalizeForInit(pose_esti, fitness_score, input, output_cloud);
+    }
 
     if (loc_inited_) {
         current_timestamp_ = math::ToSec(input->header.stamp);
@@ -309,9 +310,9 @@ bool LidarLoc::InitWithFP(CloudPtr input, const SE3& fp_pose) {
         last_abs_pose_ = pose_esti;
 
         current_score_ = fitness_score;
-        LOG(INFO) << "fitness_score is: " << fitness_score << ", global_pose is: " << fp_pose.translation().transpose();
+        LOG(INFO) << "fitness_score is: " << fitness_score << ", global_pose is: " << guess.pose_.translation().transpose();
         LOG(INFO) << " [Loc init pose]: " << last_abs_pose_.translation().transpose();
-        map_height_ = fp_pose.translation()[2];
+        map_height_ = guess.pose_.translation()[2];
 
         if (current_lo_pose_set_) {
             // 设置上一次的相对定位结果
@@ -321,16 +322,128 @@ bool LidarLoc::InitWithFP(CloudPtr input, const SE3& fp_pose) {
             last_dr_pose_ = current_dr_pose_;
             last_dr_pose_set_ = true;
         }
-
-        //  定位成功，则清空失败记录
-        fp_init_fail_pose_vec_.clear();
     } else {
-        // 添加失败历史记录
-        LOG(INFO) << "init failed, score: " << fitness_score;
-        fp_init_fail_pose_vec_.emplace_back(fp_pose);
-        fp_last_tried_time_ = 1e-6 * static_cast<double>(input->header.stamp);
+        LOG(INFO) << "init with " << guess.source_ << " failed, score: " << fitness_score
+                  << ", th=" << options_.min_init_confidence_;
     }
     return loc_inited_;
+}
+
+bool LidarLoc::LocalizeForInit(SE3& pose, double& confidence, CloudPtr input, CloudPtr output) {
+    // 初值可能偏差较大，跟踪用的配准只迭代 4 次，收敛不到位时得分偏低
+    // 先用粗分辨率扩大收敛范围，再用细分辨率多迭代几轮
+    for (int i = 0; i < 3; ++i) {
+        Localize(pose, confidence, input, output, true);
+    }
+
+    bool success = false;
+    for (int i = 0; i < 5; ++i) {
+        success = Localize(pose, confidence, input, output);
+    }
+    return success;
+}
+
+/// 保留 pose 的 xyz 和 yaw，roll/pitch 换成 attitude 的（ZYX 欧拉角，与 XYZRPYToSE3 一致）
+static SE3 WithRollPitchOf(const SE3& pose, const SE3& attitude) {
+    auto rpy = math::SE3ToRollPitchYaw(pose);
+    const auto att = math::SE3ToRollPitchYaw(attitude);
+    rpy.roll = att.roll;
+    rpy.pitch = att.pitch;
+    LOG(INFO) << "reloc guess roll/pitch from gravity (deg): " << rpy.roll * constant::kRAD2DEG << ", "
+              << rpy.pitch * constant::kRAD2DEG << ", keep yaw " << rpy.yaw * constant::kRAD2DEG;
+    return math::XYZRPYToSE3(rpy);
+}
+
+bool LidarLoc::TryInit(CloudPtr input, double current_time) {
+    /// 失败后需间隔一段时间或移动一段距离再重试
+    if (init_failed_) {
+        bool moved =
+            current_dr_pose_set_ &&
+            ((current_dr_pose_.translation() - init_fail_dr_pose_.translation()).norm() > 0.3 ||
+             (current_dr_pose_.so3().inverse() * init_fail_dr_pose_.so3()).log().norm() > 10 * M_PI / 180.0);
+        if (current_time - init_fail_time_ <= 2.0 && !moved) {
+            LOG(INFO) << "skip trying init, please move to another place.";
+            return false;
+        }
+    }
+
+    /// 候选初值：先试重定位初值，再试功能点
+    std::vector<RelocGuess> guesses;
+    {
+        UL lock(reloc_guess_mutex_);
+        if (reloc_guess_ && reloc_guess_->rp_from_gravity_ && !current_lo_pose_set_) {
+            // 还没有 LO 姿态，无法取 roll/pitch，下一帧再试，不计入失败次数
+            LOG(INFO) << "reloc guess from " << reloc_guess_->source_ << " waits for LO attitude";
+        } else if (reloc_guess_) {
+            RelocGuess guess = *reloc_guess_;
+
+            // 初值是收到它时的位姿，重试时机器人可能已经移动，用 LO 递推到当前帧
+            // 朝向不可信时递推会把位置也推偏，不递推
+            if (!guess.search_yaw_ && current_lo_pose_set_) {
+                if (!reloc_guess_lo_set_) {
+                    reloc_guess_lo_pose_ = current_lo_pose_;
+                    reloc_guess_lo_set_ = true;
+
+                    // roll/pitch 要取自记录的这一帧，之后递推才能保持与重力一致
+                    if (reloc_guess_->rp_from_gravity_) {
+                        reloc_guess_->pose_ = WithRollPitchOf(reloc_guess_->pose_, reloc_guess_lo_pose_);
+                        reloc_guess_->rp_from_gravity_ = false;
+                        guess = *reloc_guess_;
+                    }
+                }
+                guess.pose_ = guess.pose_ * reloc_guess_lo_pose_.inverse() * current_lo_pose_;
+            } else if (guess.rp_from_gravity_) {
+                guess.pose_ = WithRollPitchOf(guess.pose_, current_lo_pose_);
+            }
+
+            guesses.emplace_back(guess);
+        }
+    }
+    const bool has_reloc_guess = !guesses.empty();
+
+    if (options_.init_with_fp_) {
+        for (const auto& fp : map_->GetAllFP()) {
+            guesses.emplace_back(fp.pose_, "fp: " + fp.name_);
+        }
+    }
+
+    for (const auto& guess : guesses) {
+        if (InitWithGuess(input, guess)) {
+            LOG(INFO) << "init with " << guess.source_;
+            init_failed_ = false;
+
+            // 初始化期间若收到了新的初值，则保留它，下一帧重新初始化
+            UL lock(reloc_guess_mutex_);
+            if (!reloc_guess_updated_) {
+                reloc_guess_.reset();
+            }
+            return true;
+        }
+    }
+
+    LOG(INFO) << "init failed, tried " << guesses.size() << " guesses.";
+    init_failed_ = true;
+    init_fail_time_ = current_time;
+    init_fail_dr_pose_ = current_dr_pose_;
+
+    /// 重定位初值只试有限次，多次失败说明它大概率是错的，继续试容易在相似场景里误匹配
+    if (has_reloc_guess && ++reloc_guess_tries_ >= options_.max_reloc_guess_tries_) {
+        UL lock(reloc_guess_mutex_);
+        if (!reloc_guess_updated_) {
+            LOG(WARNING) << "reloc guess from " << reloc_guess_->source_ << " failed " << reloc_guess_tries_
+                         << " times, dropped.";
+            reloc_guess_.reset();
+        }
+    }
+
+    return false;
+}
+
+void LidarLoc::LoadMapAt(const SE3& pose) {
+    map_->LoadOnPose(pose);
+    if (map_->MapUpdated() || map_->DynamicMapUpdated()) {
+        UpdateGlobalMap();
+    }
 }
 
 void LidarLoc::ResetLastPose(const SE3& last_pose) {
@@ -427,14 +540,11 @@ void LidarLoc::UpdateMapThread() {
     }
 }
 
-void LidarLoc::SetInitialPose(SE3 init_pose) {
-    UL lock(initial_pose_mutex_);
-    loc_inited_ = false;
-    // map_->ClearMap();
-
-    initial_pose_set_ = true;
-    initial_pose_ = init_pose;
-    LOG(INFO) << "Set initial pose is: " << initial_pose_.translation().transpose();
+void LidarLoc::SetInitialPose(const RelocGuess& guess) {
+    UL lock(reloc_guess_mutex_);
+    reloc_guess_ = guess;
+    reloc_guess_updated_ = true;
+    LOG(INFO) << "Set initial pose from " << guess.source_ << ": " << guess.pose_.translation().transpose();
 }
 
 void LidarLoc::Align(const CloudPtr& input) {
@@ -454,6 +564,25 @@ void LidarLoc::Align(const CloudPtr& input) {
 
     if (!AssignDRPose(current_time)) {
         LOG(WARNING) << "assign DR pose failed";
+    }
+
+    /// 收到新的重定位初值，重新初始化
+    bool reinit = false;
+    {
+        UL lock(reloc_guess_mutex_);
+        if (reloc_guess_updated_) {
+            reloc_guess_updated_ = false;
+            reloc_guess_lo_set_ = false;
+            reloc_guess_tries_ = 0;
+            init_failed_ = false;
+            reinit = loc_inited_;
+            loc_inited_ = false;
+        }
+    }
+
+    if (reinit) {
+        // 跟踪期间不更新粗分辨率的匹配目标，这里补上
+        UpdateGlobalMap();
     }
 
     /// 1. 车辆静止处理
@@ -477,61 +606,9 @@ void LidarLoc::Align(const CloudPtr& input) {
 
     /// 2. 初始化处理
     if (!loc_inited_) {
-        UL lock_init(initial_pose_mutex_);
         LOG(INFO) << "initing lidarloc";
         SetInitRltState();
-
-        if (initial_pose_set_) {
-            /// 尝试在给定点初始化
-            if (InitWithFP(input, initial_pose_)) {
-                LOG(INFO) << "init with external pose: " << initial_pose_.translation().transpose();
-                initial_pose_set_ = false;
-                return;
-            }
-        }
-
-        if (options_.init_with_fp_) {
-            /// 从功能点初始化
-            /// 如果之前尝试过，那么需要间隔一段时间再进行搜索
-            if (!fp_init_fail_pose_vec_.empty() && current_dr_pose_set_) {
-                SE3 last_tried_pose = fp_init_fail_pose_vec_.back();
-                bool should_try =
-                    (current_time - fp_last_tried_time_) > 2.0 ||
-                    (current_dr_pose_.translation() - last_tried_pose.translation()).norm() > 0.3 ||
-                    (current_dr_pose_.so3().inverse() * last_tried_pose.so3()).log().norm() > 10 * M_PI / 180.0;
-                if (!should_try) {
-                    LOG(INFO) << "skip trying init, please move to another place.";
-                    return;
-                }
-            } else {
-                LOG(INFO) << "fp tried pose: " << fp_init_fail_pose_vec_.size()
-                          << ", dr pose set: " << current_dr_pose_set_;
-            }
-
-            auto all_fps = map_->GetAllFP();
-            bool fp_init_success = false;
-            for (const auto& fp : all_fps) {
-                map_->LoadOnPose(fp.pose_);
-                if (InitWithFP(input, fp.pose_)) {
-                    LOG(INFO) << "init with fp: " << fp.name_;
-                    fp_init_success = true;
-                    break;
-                }
-            }
-
-            if (!fp_init_success) {
-                LOG(INFO) << "FP init failed.";
-                if (current_dr_pose_set_) {
-                    LOG(INFO) << "record fp failed time: " << std::setprecision(12) << current_time
-                              << ", pose: " << current_dr_pose_.translation().transpose();
-                    fp_last_tried_time_ = current_time;
-                    fp_init_fail_pose_vec_.emplace_back(current_dr_pose_);
-                }
-            } else {
-                fp_last_tried_time_ = 0;
-                fp_init_fail_pose_vec_.clear();
-            }
-        }
+        TryInit(input, current_time);
 
         /// 初始化未成功时，不往下走流程
         return;
@@ -850,11 +927,8 @@ bool LidarLoc::Localize(SE3& pose, double& confidence, CloudPtr input, CloudPtr 
         pcl::io::savePCDFile("./data/tgt.pcd", *tgt);
     }
 
-    if (loc_inited_ == false && confidence > options_.min_init_confidence_) {
-        loc_success = true;
-    } else {
-        loc_success = true;
-    }
+    // 初始化时要求得分达到阈值，跟踪时的匹配质量由后续流程判断
+    loc_success = loc_inited_ || confidence > options_.min_init_confidence_;
 
     if (options_.enable_icp_adjust_ && loc_inited_) {
         Eigen::Matrix4f adjust_trans;

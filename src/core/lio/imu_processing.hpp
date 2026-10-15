@@ -40,6 +40,7 @@ class ImuProcess {
 
     bool IsIMUInited() const { return imu_need_init_ == false; }
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
+    void SetGravityAlign(bool b) { gravity_align_ = b; }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
 
@@ -76,8 +77,28 @@ class ImuProcess {
     bool imu_need_init_ = true;
 
     bool use_imu_filter_ = true;
+    bool gravity_align_ = false;  // 是否把世界系的 -Z 对齐到重力方向
     IMUFilter filter_;
 };
+
+/**
+ * 由静止时加计均值（比力方向，即物理上方）求 IMU 到重力对齐世界系的旋转 R_wb
+ * 世界系 +Z 朝上，航向取 IMU x 轴在水平面上的投影，雷达倒装时也能保持朝向不变
+ */
+inline SO3 GravityAlignedRotation(const Vec3d &mean_acc) {
+    const Vec3d z = mean_acc.normalized();  // 世界 Z 轴在 IMU 系下的方向
+    Vec3d ref = Vec3d::UnitX();
+    if (std::abs(z.dot(ref)) > 0.9) {
+        ref = Vec3d::UnitY();  // x 轴接近竖直时改用 y 轴定航向
+    }
+
+    const Vec3d x = (ref - ref.dot(z) * z).normalized();
+    const Vec3d y = z.cross(x);
+
+    Mat3d R_bw;
+    R_bw << x, y, z;
+    return SO3(Quatd(R_bw.transpose()).normalized());
+}
 
 inline ImuProcess::ImuProcess() : b_first_frame_(true), imu_need_init_(true) {
     init_iter_num_ = 1;
@@ -156,7 +177,12 @@ inline void ImuProcess::IMUInit(const MeasureGroup &meas, ESKF &kf_state, int &N
 
     auto init_state = kf_state.GetX();
     init_state.timestamp_ = meas.imu_.back()->timestamp;
-    init_state.grav_ = -mean_acc_ / mean_acc_.norm() * G_m_s2;
+    if (gravity_align_) {
+        init_state.rot_ = GravityAlignedRotation(mean_acc_);
+        init_state.grav_ = Vec3d(0, 0, -G_m_s2);
+    } else {
+        init_state.grav_ = -mean_acc_ / mean_acc_.norm() * G_m_s2;
+    }
     init_state.bg_ = mean_gyr_;
     kf_state.ChangeX(init_state);
 
@@ -346,6 +372,12 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
             LOG(INFO) << "imu init done, bg: " << imu_state.bg_.transpose() << ", grav: " << imu_state.grav_.transpose()
                       << ", acc scale: " << acc_scale_factor_ << ", mean: " << mean_acc_.transpose() << ", "
                       << mean_gyr_.transpose();
+            if (gravity_align_) {
+                // IMU z 轴与竖直向上的夹角，雷达倒装时接近 180 度
+                const double tilt = std::acos(std::clamp(mean_acc_.normalized().z(), -1.0, 1.0)) * 180 / M_PI;
+                LOG(INFO) << "gravity aligned, imu z tilt from up: " << tilt
+                          << " deg, init rot q: " << imu_state.rot_.unit_quaternion().coeffs().transpose();
+            }
         } else {
             LOG(INFO) << "waiting for imu init ... " << init_iter_num_;
         }

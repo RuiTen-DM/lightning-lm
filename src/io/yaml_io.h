@@ -47,6 +47,13 @@ class YAML_IO {
         return res;
     }
 
+    /// NODE下是否有key，用于可选参数
+    bool HasValue(const std::string &node, const std::string &key) const {
+        assert(is_opened_);
+        auto n = yaml_node_[node];
+        return n.IsDefined() && n[key].IsDefined();
+    }
+
     /// 设定类型为T的参数值
     template <typename T>
     void SetValue(const std::string &key, const T &value) {

@@ -66,17 +66,17 @@ bool LocSystem::Init(const std::string &yaml_path) {
     bool ret = loc_->Init(yaml_path, map_path);
     if (ret) {
         LOG(INFO) << "online loc node has been created.";
+        loc_started_ = true;
     }
 
     return ret;
 }
 
-void LocSystem::SetInitPose(const SE3 &pose) {
-    LOG(INFO) << "set init pose: " << pose.translation().transpose() << ", "
-              << pose.unit_quaternion().coeffs().transpose();
+void LocSystem::SetInitPose(const loc::RelocGuess &guess) {
+    LOG(INFO) << "set init pose from " << guess.source_ << ": " << guess.pose_.translation().transpose() << ", "
+              << guess.pose_.unit_quaternion().coeffs().transpose();
 
-    loc_->SetExternalPose(pose.unit_quaternion(), pose.translation());
-    loc_started_ = true;
+    loc_->SetExternalPose(guess);
 }
 
 void LocSystem::ProcessIMU(const IMUPtr &imu) {
