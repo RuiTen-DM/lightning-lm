@@ -18,7 +18,7 @@ fasterlio:
   filter_size_scan: 0.5 # 对scan进行的降采样
   filter_size_map: 0.5
 
-  ivox_grid_resolution: 0.5        # default=0.2
+  ivox_grid_resolution: 0.55       # default=0.2；0.5 时 IMU 质量差的走廊包（10_09）会跟丢，0.55 在 x86 和 Jetson 上都稳
   ivox_nearby_type: 18             # 6, 18, 26
   esti_plane_threshold: 0.1        # default=0.1
 

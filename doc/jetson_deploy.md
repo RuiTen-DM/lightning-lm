@@ -144,7 +144,7 @@ Ignoring a topic '/livox/lidar', reason: package 'livox_ros_driver2' not found
 
 ### 10. 无头运行要关 UI
 
-`config/default_livox.yaml` 里是 `with_ui: true`，在无头设备上要关掉。为此新建了 `config/default_livox_jetson.yaml`，和原配置只差 `with_ui: false` 这一项。注意离线建图会把结果存到**当前目录**下的 `./data/new_map`，存之前会先删掉这个目录，所以测试都在 `data/jetson_test/` 下跑，避免覆盖开发机同步过来的 `data/new_map`。
+`config/default_livox.yaml` 里是 `with_ui: true`，在无头设备上要关掉。为此新建了 `config/default_livox_jetson.yaml`，和原配置只差 `with_ui: false` 这一项。它由 `build_lightning.sh` 在每次编译前从 `default_livox.yaml` 重新生成，不要手改；它没有进仓库，在 Jetson 的 `.git/info/exclude` 里忽略。注意离线建图会把结果存到**当前目录**下的 `./data/new_map`，存之前会先删掉这个目录，所以测试都在 `data/jetson_test/` 下跑，避免覆盖开发机同步过来的 `data/new_map`。
 
 ### 11. 运行时看到的现象（不是 Jetson 特有）
 
