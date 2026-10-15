@@ -64,6 +64,13 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
 
         ivox_options_.resolution_ = yaml["fasterlio"]["ivox_grid_resolution"].as<float>();
         ivox_nearby_type = yaml["fasterlio"]["ivox_nearby_type"].as<int>();
+        // 可选参数：局部地图最多保留的格子数，超出后淘汰最久没有加点的格子，缺省时为 ivox 的默认值
+        if (yaml["fasterlio"]["ivox_capacity"].IsDefined()) {
+            int capacity = yaml["fasterlio"]["ivox_capacity"].as<int>();
+            if (capacity > 0) {
+                ivox_options_.capacity_ = capacity;
+            }
+        }
         use_aa_ = yaml["fasterlio"]["use_aa"].as<bool>();
 
         skip_lidar_num_ = yaml["fasterlio"]["skip_lidar_num"].as<int>();
@@ -93,7 +100,8 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         return false;
     }
 
-    LOG(INFO) << "lidar_type " << lidar_type;
+    LOG(INFO) << "lidar_type " << lidar_type << ", ivox resolution " << ivox_options_.resolution_ << ", capacity "
+              << ivox_options_.capacity_;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
         LOG(INFO) << "Using AVIA Lidar";
@@ -478,6 +486,35 @@ void LaserMapping::ProcessPointCloud2(CloudPtr cloud) {
             last_timestamp_lidar_ = timestamp;
         },
         "Preprocess (Standard)");
+}
+
+bool LaserMapping::HasPendingScan() {
+    UL lock(mtx_buffer_);
+    return !lidar_buffer_.empty();
+}
+
+int LaserMapping::LimitBuffers(double max_imu_age, size_t max_scans) {
+    UL lock(mtx_buffer_);
+
+    int dropped = 0;
+    while (lidar_buffer_.size() > max_scans) {
+        lidar_buffer_.pop_front();
+        time_buffer_.pop_front();
+        lidar_pushed_ = false;  // 队首变了，要重新计算结束时间
+        dropped++;
+    }
+
+    // 待处理点云之前的 IMU 去畸变时用不到，留 0.1 秒余量
+    double cutoff = last_timestamp_imu_ - max_imu_age;
+    if (!time_buffer_.empty()) {
+        cutoff = std::min(cutoff, time_buffer_.front() - 0.1);
+    }
+
+    while (!imu_buffer_.empty() && imu_buffer_.front()->timestamp < cutoff) {
+        imu_buffer_.pop_front();
+    }
+
+    return dropped;
 }
 
 bool LaserMapping::SyncPackages() {

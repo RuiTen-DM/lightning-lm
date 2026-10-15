@@ -115,6 +115,20 @@ class LaserMapping {
      */
     CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = 0.1);
 
+    /// 是否还有缓存着、没处理的点云
+    bool HasPendingScan();
+
+    /// 局部地图（iVox）里的格子数
+    size_t NumLocalMapGrids() const { return ivox_ ? ivox_->NumValidGrids() : 0; }
+
+    /**
+     * 限制输入缓存，长期运行时定期调用
+     * 传感器断流时缓存会一直增长：雷达停了 IMU 会越攒越多，IMU 停了点云会越攒越多
+     * 丢掉比最新 IMU 早 max_imu_age 秒以上、且比待处理点云更早的 IMU，以及超出 max_scans 帧的旧点云
+     * @return 丢掉的点云帧数
+     */
+    int LimitBuffers(double max_imu_age, size_t max_scans);
+
    private:
     // sync lidar with imu
     bool SyncPackages();
