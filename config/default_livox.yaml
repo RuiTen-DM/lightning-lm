@@ -63,6 +63,11 @@ lio_online: # run_lio_online（持续运行的里程计）的输出
   pub_tf: true                  # 发布 odom_frame -> base_frame 的 TF
   max_extrapolation: 0.5        # 超过这么久（秒）没有激光更新就停发，避免外推跑飞
   status_interval: 10.0         # 每隔多少秒打印一次运行状态，<= 0 不打印
+  # 结果记录（精简 csv，见 LioRecorder）：为空时不记。status.csv 随状态打印，stops.csv 每次停稳一行，traj_日期.csv 按天分
+  record_dir: ""
+  record_interval: 1.0          # 移动时轨迹每隔多少秒记一行
+  record_static_interval: 60.0  # 静止时轨迹每隔多少秒记一行
+  record_keep_days: 30          # 轨迹文件保留天数
 
 system:
   with_loop_closing: true # 是否需要回环检测

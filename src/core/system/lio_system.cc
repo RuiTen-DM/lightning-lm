@@ -10,6 +10,8 @@
 #include <fstream>
 #include <string>
 
+#include <sys/resource.h>
+
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
 #include "core/lio/laser_mapping.h"
@@ -63,6 +65,21 @@ bool LioSystem::Init(const std::string &yaml_path) {
     }
     if (yaml.HasValue(sec, "status_interval")) {
         options_.status_interval_ = yaml.GetValue<double>(sec, "status_interval");
+    }
+    auto &rec = options_.record_;
+    if (yaml.HasValue(sec, "record_dir")) rec.dir_ = yaml.GetValue<std::string>(sec, "record_dir");
+    if (yaml.HasValue(sec, "record_interval")) rec.interval_ = yaml.GetValue<double>(sec, "record_interval");
+    if (yaml.HasValue(sec, "record_static_interval")) {
+        rec.static_interval_ = yaml.GetValue<double>(sec, "record_static_interval");
+    }
+    if (yaml.HasValue(sec, "record_keep_days")) rec.keep_days_ = yaml.GetValue<int>(sec, "record_keep_days");
+
+    if (!rec.dir_.empty()) {
+        recorder_ = std::make_shared<LioRecorder>();
+        if (!recorder_->Init(rec)) {
+            LOG(ERROR) << "failed to init recorder in " << rec.dir_;
+            return false;
+        }
     }
 
     LaserMapping::Options lio_options;
@@ -169,6 +186,9 @@ void LioSystem::RunLIO() {
         interval_run_ms_ += ms;
         interval_max_ms_ = std::max(interval_max_ms_, ms);
         last_lio_time_ = lio_->GetState().timestamp_;
+        if (recorder_ && num_frames_ >= 2) {
+            recorder_->AddState(lio_->GetState());
+        }
     }
 
     scan_waiting_ = false;
@@ -227,15 +247,35 @@ void LioSystem::OnTimer() {
     if (last_status_time_ > 0 && now - last_status_time_ < options_.status_interval_) {
         return;
     }
+
+    const double interval = now - last_status_time_;
     last_status_time_ = now;
+
+    // 进程在这段时间里的 CPU 占用（占单核的百分比）
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+    const double cpu_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec * 1e-6 + usage.ru_stime.tv_sec +
+                            usage.ru_stime.tv_usec * 1e-6;
+    const double cpu_pct = last_cpu_time_ > 0 && interval > 0 ? (cpu_time - last_cpu_time_) / interval * 100 : 0;
+    last_cpu_time_ = cpu_time;
 
     const auto state = lio_->GetState();
     const double avg_ms = interval_frames_ > 0 ? interval_run_ms_ / interval_frames_ : 0;
+    const double rss = ReadRssMB();
     RCLCPP_INFO(node_->get_logger(),
                 "frames %ld/%ld scans, dropped %ld, imu %ld, odom %ld | lio %.2f ms avg, %.2f ms max | "
-                "local map %zu grids | rss %.1f MB | pos %.2f %.2f %.2f",
+                "local map %zu grids | rss %.1f MB | cpu %.0f%% | pos %.2f %.2f %.2f",
                 num_frames_, num_scans_, num_dropped_, num_imu_, num_published_, avg_ms, interval_max_ms_,
-                lio_->NumLocalMapGrids(), ReadRssMB(), state.pos_.x(), state.pos_.y(), state.pos_.z());
+                lio_->NumLocalMapGrids(), rss, cpu_pct, state.pos_.x(), state.pos_.y(), state.pos_.z());
+
+    if (recorder_) {
+        const Mat3d R = state.rot_.matrix();
+        char fields[256];
+        snprintf(fields, sizeof(fields), "%ld,%ld,%ld,%.2f,%.2f,%zu,%.1f,%.0f,%.3f,%.3f,%.3f,%.2f", num_frames_,
+                 num_scans_, num_dropped_, avg_ms, interval_max_ms_, lio_->NumLocalMapGrids(), rss, cpu_pct,
+                 state.pos_.x(), state.pos_.y(), state.pos_.z(), std::atan2(R(1, 0), R(0, 0)) * 180.0 / M_PI);
+        recorder_->AddStatus(fields);
+    }
 
     interval_frames_ = 0;
     interval_run_ms_ = 0;
