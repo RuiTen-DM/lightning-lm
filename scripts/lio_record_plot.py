@@ -124,7 +124,7 @@ def main():
     parser = argparse.ArgumentParser(description='把 run_lio_online 的记录画成 html')
     parser.add_argument('dir')
     parser.add_argument('-o', '--output', help='输出 html，默认 <记录目录>/lio_record.html')
-    parser.add_argument('--cluster', type=float, default=3.0, help='停靠点归类的距离（米）')
+    parser.add_argument('--cluster', type=float, default=1.0, help='停靠点归类的距离（米）；漂移超过它时同一停靠点会被拆成相邻的两个')
     args = parser.parse_args()
     d = args.dir
     out = args.output or os.path.join(d, 'lio_record.html')

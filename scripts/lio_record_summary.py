@@ -2,7 +2,7 @@
 """
 汇总 run_lio_online 记录的结果（lio_online/record_dir 下的 status.csv、stops.csv、traj_*.csv）。
 
-    python3 scripts/lio_record_summary.py <记录目录> [--cluster 3.0]
+    python3 scripts/lio_record_summary.py <记录目录> [--cluster 1.0]
 
 输出：
     - 启动次数（每次启动在 status.csv 里有一行 "# start"，多次说明重启过）和本次运行时长
@@ -39,7 +39,7 @@ def read_status(path):
 def main():
     parser = argparse.ArgumentParser(description='汇总 run_lio_online 的记录')
     parser.add_argument('dir')
-    parser.add_argument('--cluster', type=float, default=3.0, help='停靠点归类的距离（米）')
+    parser.add_argument('--cluster', type=float, default=1.0, help='停靠点归类的距离（米）；漂移超过它时同一停靠点会被拆成相邻的两个')
     args = parser.parse_args()
 
     starts, rows = read_status(os.path.join(args.dir, 'status.csv'))
