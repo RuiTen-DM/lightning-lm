@@ -9,6 +9,10 @@
     - 最新状态，以及运行以来 CPU、内存、每帧耗时、局部地图的最大值
     - 停靠点：把位置相近（--cluster 米内）的停稳记录归为同一个点，列出次数、首末时间、首末位置之差。
       往复运动时同一停靠点的位置随时间的变化，就是里程计的漂移
+      每次重启后里程计从当时的位置重新开始，坐标系不同，所以停靠点按每次运行分开统计
+
+也可以直接在板子上运行，只把文字结果传回来：
+    ssh -p <端口> <用户>@<板子> python3 lightning_lio/lio_record_summary.py lightning_lio/records
 """
 
 import argparse
@@ -58,20 +62,29 @@ def main():
             stops.append((r['time'], np.array([float(r['x']), float(r['y']), float(r['z'])]), float(r['path_m'])))
     print(f'\n停稳 {len(stops)} 次，共走 {sum(s[2] for s in stops) / 1000:.2f} km')
 
-    clusters = []  # 每个停靠点：记录列表
+    # 按启动时间把停稳记录分到各次运行
+    start_times = [s.split(' pid')[0] for s in starts]
+    sessions = {}
     for s in stops:
-        for c in clusters:
-            if np.linalg.norm(c[0][1][:2] - s[1][:2]) < args.cluster:
-                c.append(s)
-                break
-        else:
-            clusters.append([s])
-    for i, c in enumerate(sorted(clusters, key=len, reverse=True)):
-        p = np.array([s[1] for s in c])
-        d = p[-1] - p[0]
-        print(f'  停靠点 {i}: {len(c)} 次，{c[0][0]} ~ {c[-1][0]}，位置约 ({p[:, 0].mean():.2f}, {p[:, 1].mean():.2f}, '
-              f'{p[:, 2].mean():.2f})，末次减首次 ({d[0]:+.3f}, {d[1]:+.3f}, {d[2]:+.3f}) m，'
-              f'范围 xy {np.ptp(p[:, 0]):.3f}/{np.ptp(p[:, 1]):.3f} z {np.ptp(p[:, 2]):.3f} m')
+        k = max([i for i, t in enumerate(start_times) if t <= s[0]], default=0)
+        sessions.setdefault(k, []).append(s)
+
+    for k in sorted(sessions):
+        print(f'  第 {k + 1} 次运行（{start_times[k] if start_times else "-"} 启动）:')
+        clusters = []  # 每个停靠点：记录列表
+        for s in sessions[k]:
+            for c in clusters:
+                if np.linalg.norm(c[0][1][:2] - s[1][:2]) < args.cluster:
+                    c.append(s)
+                    break
+            else:
+                clusters.append([s])
+        for i, c in enumerate(sorted(clusters, key=len, reverse=True)):
+            p = np.array([s[1] for s in c])
+            d = p[-1] - p[0]
+            print(f'    停靠点 {i}: {len(c)} 次，{c[0][0]} ~ {c[-1][0]}，位置约 ({p[:, 0].mean():.2f}, '
+                  f'{p[:, 1].mean():.2f}, {p[:, 2].mean():.2f})，末次减首次 ({d[0]:+.3f}, {d[1]:+.3f}, {d[2]:+.3f}) m，'
+                  f'范围 xy {np.ptp(p[:, 0]):.3f}/{np.ptp(p[:, 1]):.3f} z {np.ptp(p[:, 2]):.3f} m')
 
     traj = sorted(glob.glob(os.path.join(args.dir, 'traj_*.csv')))
     n = sum(max(0, sum(1 for _ in open(t)) - 1) for t in traj)

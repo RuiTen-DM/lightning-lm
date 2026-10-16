@@ -110,6 +110,65 @@ python3 ~/lightning-lm/scripts/bag_loop_player.py \
 
 另外，测试用的 Python 放包脚本约占 6% CPU，odom 记录脚本约占 26%。
 
+## 结果记录（长期运行后取回）
+
+`lio_online/record_dir` 不为空时，程序把结果精简地记成 csv。时间都用系统时间：
+
+| 文件 | 内容 | 大小 |
+|---|---|---|
+| `status.csv` | 每个状态间隔一行：帧数、丢帧、每帧耗时、局部地图格数、内存、CPU、位置。每次启动先写一行 `# start`，可以看出有没有重启 | 间隔 60 秒时约 150 KB/天 |
+| `stops.csv` | 机器人每次停稳记一行：至少走过 1 m 后静止 3 秒，记录位姿和这一段的路程。往复运动时，同一停靠点的位置随时间的变化就是里程计的漂移 | 很小 |
+| `traj_日期.csv` | 轨迹：移动时每秒一行，静止时每分钟一行。按天分文件，超过 `record_keep_days`（默认 30）天的删掉 | 一直在动时约 4 MB/天 |
+
+汇总：
+
+```bash
+python3 scripts/lio_record_summary.py <记录目录>
+```
+
+内容包括：启动次数和本次运行时长、最新状态、运行以来的最大值，以及各停靠点的次数和首末位置差。每次重启后坐标系从当时的位置重新开始，所以停靠点按每次运行分开统计。
+
+## 部署到没有 sudo、不方便编译的设备
+
+现场板子上不能装包（没有 sudo），负载也高。所以在同型号的开发板上编译，只拷运行需要的文件过去：
+
+- 程序本体约 8 MB（已去掉调试信息）：`run_lio_online`、`liblightning.libs.so`、`libmiao.*`、`liblightning__rosidl_*`、`liblivox_ros_driver2__rosidl_*`。
+- 外加板子上缺的 NVIDIA OpenCV 4.8 运行库（core/highgui/imgcodecs/imgproc）。
+- 合计 18 MB，压缩后 6 MB。
+
+拷过去之前，先在开发板上用 `ldd` 列出依赖，再到目标板上逐个确认是否存在。目录结构：
+
+```
+~/lightning_lio/
+├── bin/run_lio_online
+├── lib/                 上面那些库，run.sh 把它加进 LD_LIBRARY_PATH
+├── config/lio_field.yaml
+├── run.sh               source /opt/ros/humble，glog 只写 stderr（进 journald），ROS 日志放 ros_log/
+├── records/             结果记录
+└── VERSION              编译所用的提交
+```
+
+用 systemd 用户服务 `~/.config/systemd/user/lightning-lio.service` 运行：
+
+- `Restart=always`，`Nice=10`，`MemoryMax=1G`，`Environment=ROS_DOMAIN_ID=0`（和驱动一致）。
+- 用户服务要等用户登录后才启动。板子开了 GDM 自动登录，所以重启后会自动起来。
+- 如果设备没有自动登录，需要 `sudo loginctl enable-linger <用户>`。
+
+```bash
+systemctl --user status lightning-lio            # 状态
+journalctl --user-unit=lightning-lio -n 50       # 日志
+systemctl --user restart lightning-lio           # 重启
+```
+
+现场机器人上 TF 由别的程序管，所以 `lio_field.yaml` 里把 `pub_tf` 关了，只发 `lightning/odom`。
+
+取回结果：
+
+```bash
+rsync -az -e 'ssh -p <端口>' <用户>@<板子>:lightning_lio/records/ ./lio_records/   # 加 --exclude 'traj_*' 只取状态和停靠点
+ssh -p <端口> <用户>@<板子> python3 lightning_lio/lio_record_summary.py lightning_lio/records   # 只看汇总
+```
+
 ## 待定 / 后续
 
 - **是否用地图实时修正。** 如果要做，修正结果用 `map -> odom` 发布。
