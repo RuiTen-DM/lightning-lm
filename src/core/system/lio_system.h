@@ -11,6 +11,9 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
+#include <atomic>
+#include <thread>
+
 #include "livox_ros_driver2/msg/custom_msg.hpp"
 
 #include "common/eigen_types.h"
@@ -33,7 +36,7 @@ class LaserMapping;
  *  - TF（可关）
  * 两次激光更新之间按匀速和陀螺外推；超过 max_extrapolation 秒没有激光更新就停发，避免外推跑飞
  *
- * 可选把结果精简地记到文件里（lio_online/record_dir），见 LioRecorder
+ * 可选把结果精简地记到文件里（lio_online/record_dir），见 LioRecorder；也可以定期把局部地图存下来
  *
  * 所有回调都在同一个单线程 executor 里执行，LIO 不需要加锁
  */
@@ -49,6 +52,8 @@ class LioSystem {
         double max_imu_age_ = 2.0;        // 缓存里最多保留多久以前的 IMU（秒）
         int max_pending_scans_ = 10;      // 最多缓存多少帧还没处理的点云（IMU 断流时会积压），多出的丢掉
         LioRecorder::Options record_;     // 结果记录，目录为空时不记
+        double map_save_interval_ = 0;    // 每隔多少秒把局部地图存一次（秒），<= 0 不存；退出时也会存
+        std::string map_dir_;             // 地图存放目录，为空时用记录目录
     };
 
     LioSystem();
@@ -72,6 +77,12 @@ class LioSystem {
     /// 定时：限制缓存，打印状态
     void OnTimer();
 
+    /**
+     * 把局部地图存成 map_dir/local_map.pcd（xyz + 强度，压缩），并在 local_map_pose.txt 里记下当时的位姿
+     * 先在当前线程拷出点云，再由后台线程写临时文件、改名，不阻塞 LIO
+     */
+    void SaveMap(bool blocking);
+
     Options options_;
     std::shared_ptr<LaserMapping> lio_ = nullptr;
 
@@ -83,6 +94,9 @@ class LioSystem {
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_ = nullptr;
     rclcpp::TimerBase::SharedPtr timer_ = nullptr;
     std::shared_ptr<LioRecorder> recorder_ = nullptr;
+    std::thread save_thread_;
+    std::atomic_bool saving_ = false;
+    double last_map_save_ = 0;
 
     bool scan_waiting_ = false;  // 有点云在等后续的 IMU
     double last_lio_time_ = 0;   // 最近一次激光更新的时间

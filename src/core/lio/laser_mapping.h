@@ -121,6 +121,9 @@ class LaserMapping {
     /// 局部地图（iVox）里的格子数
     size_t NumLocalMapGrids() const { return ivox_ ? ivox_->NumValidGrids() : 0; }
 
+    /// 局部地图（iVox）里所有的点，世界系下
+    CloudPtr GetLocalMap() const;
+
     /**
      * 限制输入缓存，长期运行时定期调用
      * 传感器断流时缓存会一直增长：雷达停了 IMU 会越攒越多，IMU 停了点云会越攒越多

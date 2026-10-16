@@ -488,6 +488,19 @@ void LaserMapping::ProcessPointCloud2(CloudPtr cloud) {
         "Preprocess (Standard)");
 }
 
+CloudPtr LaserMapping::GetLocalMap() const {
+    CloudPtr cloud(new PointCloudType);
+    if (ivox_) {
+        IVoxType::PointVector points;
+        ivox_->GetAllPoints(points);
+        cloud->points.assign(points.begin(), points.end());
+    }
+    cloud->width = cloud->size();
+    cloud->height = 1;
+    cloud->is_dense = false;
+    return cloud;
+}
+
 bool LaserMapping::HasPendingScan() {
     UL lock(mtx_buffer_);
     return !lidar_buffer_.empty();

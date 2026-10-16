@@ -87,6 +87,9 @@ class IVox {
     /// get number of valid grids
     size_t NumValidGrids() const;
 
+    /// 取出所有格子里的点
+    void GetAllPoints(PointVector& points) const;
+
     /// get statistics of the points
     std::vector<float> StatGridPoints() const;
 
@@ -198,6 +201,17 @@ bool IVox<dim, node_type, PointType>::GetClosestPoint(const PointType& pt, Point
 template <int dim, IVoxNodeType node_type, typename PointType>
 size_t IVox<dim, node_type, PointType>::NumValidGrids() const {
     return grids_map_.size();
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
+void IVox<dim, node_type, PointType>::GetAllPoints(PointVector& points) const {
+    points.clear();
+    points.reserve(grids_cache_.size() * 4);
+    for (const auto& grid : grids_cache_) {
+        for (std::size_t i = 0; i < grid.second.Size(); ++i) {
+            points.emplace_back(grid.second.GetPoint(i));
+        }
+    }
 }
 
 template <int dim, IVoxNodeType node_type, typename PointType>
