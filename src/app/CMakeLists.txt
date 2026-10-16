@@ -61,6 +61,15 @@ target_link_libraries(run_lio_online
         ${third_party_libs}
 )
 
+add_executable(run_pcd_to_map
+        run_pcd_to_map.cc
+)
+
+target_link_libraries(run_pcd_to_map
+        ${PROJECT_NAME}.libs
+        ${third_party_libs}
+)
+
 add_executable(test_ui
         test_ui.cc
 )
@@ -70,5 +79,5 @@ target_link_libraries(test_ui
         ${third_party_libs}
 )
 
-install(TARGETS run_slam_offline run_slam_online run_loc_offline run_loc_online run_lio_online
+install(TARGETS run_slam_offline run_slam_online run_loc_offline run_loc_online run_lio_online run_pcd_to_map
         DESTINATION lib/${PROJECT_NAME})
