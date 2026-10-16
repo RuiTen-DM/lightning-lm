@@ -10,7 +10,14 @@
 #include <fstream>
 #include <string>
 
+#include <sys/resource.h>
+
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+
+#include <ctime>
+#include <filesystem>
 
 #include "core/lio/laser_mapping.h"
 #include "io/yaml_io.h"
@@ -47,7 +54,15 @@ builtin_interfaces::msg::Time ToRosTime(double t) {
 
 LioSystem::LioSystem() = default;
 
-LioSystem::~LioSystem() = default;
+LioSystem::~LioSystem() {
+    if (save_thread_.joinable()) {
+        save_thread_.join();
+    }
+    // 退出（包括 systemd 停止、重启）时存一次最新的局部地图
+    if (options_.map_save_interval_ > 0 && num_frames_ >= 2) {
+        SaveMap(true);
+    }
+}
 
 bool LioSystem::Init(const std::string &yaml_path) {
     YAML_IO yaml(yaml_path);
@@ -63,6 +78,48 @@ bool LioSystem::Init(const std::string &yaml_path) {
     }
     if (yaml.HasValue(sec, "status_interval")) {
         options_.status_interval_ = yaml.GetValue<double>(sec, "status_interval");
+    }
+    auto &rec = options_.record_;
+    if (yaml.HasValue(sec, "record_dir")) rec.dir_ = yaml.GetValue<std::string>(sec, "record_dir");
+    if (yaml.HasValue(sec, "record_interval")) rec.interval_ = yaml.GetValue<double>(sec, "record_interval");
+    if (yaml.HasValue(sec, "record_static_interval")) {
+        rec.static_interval_ = yaml.GetValue<double>(sec, "record_static_interval");
+    }
+    if (yaml.HasValue(sec, "record_keep_days")) rec.keep_days_ = yaml.GetValue<int>(sec, "record_keep_days");
+
+    if (yaml.HasValue(sec, "map_save_interval")) {
+        options_.map_save_interval_ = yaml.GetValue<double>(sec, "map_save_interval");
+    }
+    if (yaml.HasValue(sec, "map_dir")) options_.map_dir_ = yaml.GetValue<std::string>(sec, "map_dir");
+    if (options_.map_dir_.empty()) {
+        options_.map_dir_ = rec.dir_;
+    }
+    if (options_.map_save_interval_ > 0) {
+        if (options_.map_dir_.empty()) {
+            LOG(WARNING) << "map_save_interval is set but neither map_dir nor record_dir is given, map is not saved";
+            options_.map_save_interval_ = 0;
+        } else {
+            // 上次运行存的地图在另一个坐标系里（每次启动从当时的位置重新开始），改名留着
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            fs::create_directories(options_.map_dir_, ec);
+            for (const std::string name : {"local_map.pcd", "local_map_pose.txt"}) {
+                const fs::path cur = fs::path(options_.map_dir_) / name;
+                if (fs::exists(cur)) {
+                    fs::path prev = cur;
+                    prev.replace_filename(cur.stem().string() + "_prev" + cur.extension().string());
+                    fs::rename(cur, prev, ec);
+                }
+            }
+        }
+    }
+
+    if (!rec.dir_.empty()) {
+        recorder_ = std::make_shared<LioRecorder>();
+        if (!recorder_->Init(rec)) {
+            LOG(ERROR) << "failed to init recorder in " << rec.dir_;
+            return false;
+        }
     }
 
     LaserMapping::Options lio_options;
@@ -169,6 +226,9 @@ void LioSystem::RunLIO() {
         interval_run_ms_ += ms;
         interval_max_ms_ = std::max(interval_max_ms_, ms);
         last_lio_time_ = lio_->GetState().timestamp_;
+        if (recorder_ && num_frames_ >= 2) {
+            recorder_->AddState(lio_->GetState());
+        }
     }
 
     scan_waiting_ = false;
@@ -219,6 +279,12 @@ void LioSystem::OnTimer() {
     // 雷达停了的时候点云回调不再触发，在这里也限制一下缓存
     num_dropped_ += lio_->LimitBuffers(options_.max_imu_age_, options_.max_pending_scans_);
 
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (options_.map_save_interval_ > 0 && num_frames_ >= 2 && wall - last_map_save_ >= options_.map_save_interval_) {
+        last_map_save_ = wall;
+        SaveMap(false);
+    }
+
     if (options_.status_interval_ <= 0) {
         return;
     }
@@ -227,19 +293,96 @@ void LioSystem::OnTimer() {
     if (last_status_time_ > 0 && now - last_status_time_ < options_.status_interval_) {
         return;
     }
+
+    const double interval = now - last_status_time_;
     last_status_time_ = now;
+
+    // 进程在这段时间里的 CPU 占用（占单核的百分比）
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+    const double cpu_time = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec * 1e-6 + usage.ru_stime.tv_sec +
+                            usage.ru_stime.tv_usec * 1e-6;
+    const double cpu_pct = last_cpu_time_ > 0 && interval > 0 ? (cpu_time - last_cpu_time_) / interval * 100 : 0;
+    last_cpu_time_ = cpu_time;
 
     const auto state = lio_->GetState();
     const double avg_ms = interval_frames_ > 0 ? interval_run_ms_ / interval_frames_ : 0;
+    const double rss = ReadRssMB();
     RCLCPP_INFO(node_->get_logger(),
                 "frames %ld/%ld scans, dropped %ld, imu %ld, odom %ld | lio %.2f ms avg, %.2f ms max | "
-                "local map %zu grids | rss %.1f MB | pos %.2f %.2f %.2f",
+                "local map %zu grids | rss %.1f MB | cpu %.0f%% | pos %.2f %.2f %.2f",
                 num_frames_, num_scans_, num_dropped_, num_imu_, num_published_, avg_ms, interval_max_ms_,
-                lio_->NumLocalMapGrids(), ReadRssMB(), state.pos_.x(), state.pos_.y(), state.pos_.z());
+                lio_->NumLocalMapGrids(), rss, cpu_pct, state.pos_.x(), state.pos_.y(), state.pos_.z());
+
+    if (recorder_) {
+        const Mat3d R = state.rot_.matrix();
+        char fields[256];
+        snprintf(fields, sizeof(fields), "%ld,%ld,%ld,%.2f,%.2f,%zu,%.1f,%.0f,%.3f,%.3f,%.3f,%.2f", num_frames_,
+                 num_scans_, num_dropped_, avg_ms, interval_max_ms_, lio_->NumLocalMapGrids(), rss, cpu_pct,
+                 state.pos_.x(), state.pos_.y(), state.pos_.z(), std::atan2(R(1, 0), R(0, 0)) * 180.0 / M_PI);
+        recorder_->AddStatus(fields);
+    }
 
     interval_frames_ = 0;
     interval_run_ms_ = 0;
     interval_max_ms_ = 0;
+}
+
+void LioSystem::SaveMap(bool blocking) {
+    if (saving_) {
+        return;  // 上一次还没写完
+    }
+
+    // 只存 xyz 和强度，比 LIO 内部的点类型小一半
+    const auto local_map = lio_->GetLocalMap();
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    cloud->resize(local_map->size());
+    for (size_t i = 0; i < local_map->size(); ++i) {
+        const auto &p = local_map->points[i];
+        auto &q = cloud->points[i];
+        q.x = p.x, q.y = p.y, q.z = p.z, q.intensity = p.intensity;
+    }
+
+    const auto state = lio_->GetState();
+    const Quatd quat = state.rot_.unit_quaternion();
+    const time_t now = time(nullptr);
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    char info[320];
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%F %T", &tm_local);
+    snprintf(info, sizeof(info),
+             "# time frames grids points x y z qx qy qz qw (odom 系，每次启动从当时的位置重新开始)\n"
+             "%s %ld %zu %zu %.4f %.4f %.4f %.6f %.6f %.6f %.6f\n",
+             stamp, num_frames_, lio_->NumLocalMapGrids(), cloud->size(), state.pos_.x(), state.pos_.y(),
+             state.pos_.z(), quat.x(), quat.y(), quat.z(), quat.w());
+
+    saving_ = true;
+    auto job = [this, cloud, info = std::string(info)]() {
+        namespace fs = std::filesystem;
+        const std::string dir = options_.map_dir_;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::error_code ec;
+        if (pcl::io::savePCDFileBinaryCompressed(dir + "/local_map.pcd.tmp", *cloud) == 0) {
+            fs::rename(dir + "/local_map.pcd.tmp", dir + "/local_map.pcd", ec);
+            std::ofstream(dir + "/local_map_pose.txt.tmp") << info;
+            fs::rename(dir + "/local_map_pose.txt.tmp", dir + "/local_map_pose.txt", ec);
+        } else {
+            LOG(WARNING) << "failed to save local map to " << dir;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        RCLCPP_INFO(node_->get_logger(), "local map saved: %zu points, %.0f ms", cloud->size(), ms);
+        saving_ = false;
+    };
+
+    if (save_thread_.joinable()) {
+        save_thread_.join();
+    }
+    if (blocking) {
+        job();
+    } else {
+        save_thread_ = std::thread(job);
+    }
 }
 
 }  // namespace lightning

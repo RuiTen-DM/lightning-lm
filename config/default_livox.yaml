@@ -21,8 +21,8 @@ fasterlio:
   ivox_grid_resolution: 0.55       # default=0.2；0.5 时 IMU 质量差的走廊包（10_09）会跟丢，0.55 在 x86 和 Jetson 上都稳
   ivox_nearby_type: 18             # 6, 18, 26
   # 局部地图最多保留的格子数，超出后淘汰最久没加过点的格子；不写时为 100 万
-  # 这条轨道来回跑 3 轮后约 6.5 万格（每格 0.55 m），留 3 倍余量。低于轨道所需时会持续淘汰，高度会慢慢漂
-  ivox_capacity: 200000
+  # 这条轨道来回跑 10 轮后约 7 万格（每格 0.55 m）。低于轨道所需时会持续淘汰，高度会慢慢漂
+  ivox_capacity: 100000
   esti_plane_threshold: 0.1        # default=0.1
 
   use_aa: false  # use anderson-acceleration
@@ -63,6 +63,13 @@ lio_online: # run_lio_online（持续运行的里程计）的输出
   pub_tf: true                  # 发布 odom_frame -> base_frame 的 TF
   max_extrapolation: 0.5        # 超过这么久（秒）没有激光更新就停发，避免外推跑飞
   status_interval: 10.0         # 每隔多少秒打印一次运行状态，<= 0 不打印
+  # 结果记录（精简 csv，见 LioRecorder）：为空时不记。status.csv 随状态打印，stops.csv 每次停稳一行，traj_日期.csv 按天分
+  record_dir: ""
+  record_interval: 1.0          # 移动时轨迹每隔多少秒记一行
+  record_static_interval: 60.0  # 静止时轨迹每隔多少秒记一行
+  record_keep_days: 30          # 轨迹文件保留天数
+  map_save_interval: 0          # 每隔多少秒把局部地图存成 local_map.pcd（退出时也存），<= 0 不存
+  map_dir: ""                   # 地图存放目录，为空时用 record_dir
 
 system:
   with_loop_closing: true # 是否需要回环检测

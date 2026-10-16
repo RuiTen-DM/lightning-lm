@@ -41,6 +41,7 @@ add_library(${PROJECT_NAME}.libs SHARED
         core/system/slam.cc
         core/system/loc_system.cc
         core/system/lio_system.cc
+        core/system/lio_recorder.cc
 
         wrapper/bag_io.cc
 )
