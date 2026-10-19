@@ -12,6 +12,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include <atomic>
+#include <deque>
 #include <thread>
 
 #include "livox_ros_driver2/msg/custom_msg.hpp"
@@ -74,6 +75,12 @@ class LioSystem {
 
     void Publish(const NavState& state, const Vec3d& gyro, double stamp);
 
+    /**
+     * 用 IMU 判断是否真正静止（不靠里程计自己）：最近 1 秒加计模长的标准差小于 4 mg，且陀螺模长都小于 0.05 rad/s。
+     * 这台机器人沿轨道平移时几乎不转，陀螺分不出动静，主要靠加计：静止时约 1–2 mg，电机一转就到 6 mg 以上
+     */
+    void UpdateImuStill(const IMUPtr& imu);
+
     /// 定时：限制缓存，打印状态
     void OnTimer();
 
@@ -99,6 +106,8 @@ class LioSystem {
     double last_map_save_ = 0;
 
     bool scan_waiting_ = false;  // 有点云在等后续的 IMU
+    std::deque<std::pair<double, Vec2d>> imu_window_;  // 最近 1 秒：时间，(加计模长, 陀螺模长)
+    bool imu_still_ = false;
     double last_lio_time_ = 0;   // 最近一次激光更新的时间
     bool extrapolation_warned_ = false;
 

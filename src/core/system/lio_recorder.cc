@@ -62,10 +62,11 @@ bool LioRecorder::Init(const Options& options) {
 
     OpenCsv(status_, options_.dir_ + "/status.csv", StatusHeader());
     OpenCsv(stops_, options_.dir_ + "/stops.csv", "time,x,y,z,yaw_deg,path_m");
+    OpenCsv(still_, options_.dir_ + "/still.csv", "start,duration_s,x0,y0,z0,dx,dy,dz,dyaw_deg,final");
     status_ << "# start " << LocalTime(WallTime(), "%F %T") << " pid " << getpid() << std::endl;
 
     OpenTraj(LocalTime(WallTime(), "%Y%m%d"));
-    return status_.good() && stops_.good() && traj_.good();
+    return status_.good() && stops_.good() && traj_.good() && still_.good();
 }
 
 void LioRecorder::OpenTraj(const std::string& date) {
@@ -92,9 +93,11 @@ void LioRecorder::RemoveOldTraj() {
     }
 }
 
-void LioRecorder::AddState(const NavState& state) {
+void LioRecorder::AddState(const NavState& state, bool imu_still) {
     const double now = WallTime();
     const Vec3d& p = state.pos_;
+
+    UpdateStill(state, imu_still, now);
 
     // 速度用最近约 1 秒的位移来算，比滤波器里的速度稳
     recent_.emplace_back(now, p);
@@ -141,6 +144,57 @@ void LioRecorder::AddState(const NavState& state) {
         stop_logged_ = true;
         path_since_stop_ = 0;
     }
+}
+
+void LioRecorder::Finish() {
+    if (in_still_ && has_state_) {
+        const double now = WallTime();
+        if (now - still_start_ >= options_.min_still_) {
+            WriteStill(last_state_, now, true);
+        }
+        in_still_ = false;
+    }
+}
+
+void LioRecorder::UpdateStill(const NavState& state, bool imu_still, double now) {
+    last_state_ = state;
+    has_state_ = true;
+    if (imu_still && !in_still_) {
+        in_still_ = true;
+        still_start_ = now;
+        last_still_report_ = now;
+        still_pos_ = state.pos_;
+        still_yaw_ = Yaw(state);
+        return;
+    }
+
+    if (!in_still_) {
+        return;
+    }
+
+    const double duration = now - still_start_;
+    if (!imu_still) {
+        in_still_ = false;
+        if (duration >= options_.min_still_) {
+            WriteStill(state, now, true);
+        }
+        return;
+    }
+
+    if (duration >= options_.min_still_ && now - last_still_report_ >= options_.still_report_) {
+        last_still_report_ = now;
+        WriteStill(state, now, false);
+    }
+}
+
+void LioRecorder::WriteStill(const NavState& state, double now, bool final) {
+    const Vec3d d = state.pos_ - still_pos_;
+    double dyaw = Yaw(state) - still_yaw_;
+    dyaw = std::remainder(dyaw, 360.0);
+    char line[256];
+    snprintf(line, sizeof(line), "%s,%.0f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,%d", LocalTime(still_start_, "%F %T").c_str(),
+             now - still_start_, still_pos_.x(), still_pos_.y(), still_pos_.z(), d.x(), d.y(), d.z(), dyaw, final ? 1 : 0);
+    still_ << line << std::endl;
 }
 
 void LioRecorder::AddStatus(const std::string& fields) {

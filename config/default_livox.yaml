@@ -63,11 +63,13 @@ lio_online: # run_lio_online（持续运行的里程计）的输出
   pub_tf: true                  # 发布 odom_frame -> base_frame 的 TF
   max_extrapolation: 0.5        # 超过这么久（秒）没有激光更新就停发，避免外推跑飞
   status_interval: 10.0         # 每隔多少秒打印一次运行状态，<= 0 不打印
-  # 结果记录（精简 csv，见 LioRecorder）：为空时不记。status.csv 随状态打印，stops.csv 每次停稳一行，traj_日期.csv 按天分
+  # 结果记录（精简 csv，见 LioRecorder）：为空时不记。status.csv 随状态打印，stops.csv 每次停稳一行，traj_日期.csv 按天分，
+  # still.csv 记 IMU 判断静止期间里程计漂了多少
   record_dir: ""
   record_interval: 1.0          # 移动时轨迹每隔多少秒记一行
   record_static_interval: 60.0  # 静止时轨迹每隔多少秒记一行
   record_keep_days: 30          # 轨迹文件保留天数
+  record_min_still: 30.0        # IMU 判断静止至少多少秒才记一段静止漂移（still.csv）
   map_save_interval: 0          # 每隔多少秒把局部地图存成 local_map.pcd（退出时也存），<= 0 不存
   map_dir: ""                   # 地图存放目录，为空时用 record_dir
 

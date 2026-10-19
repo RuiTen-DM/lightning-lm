@@ -55,6 +55,9 @@ builtin_interfaces::msg::Time ToRosTime(double t) {
 LioSystem::LioSystem() = default;
 
 LioSystem::~LioSystem() {
+    if (recorder_) {
+        recorder_->Finish();
+    }
     if (save_thread_.joinable()) {
         save_thread_.join();
     }
@@ -86,6 +89,7 @@ bool LioSystem::Init(const std::string &yaml_path) {
         rec.static_interval_ = yaml.GetValue<double>(sec, "record_static_interval");
     }
     if (yaml.HasValue(sec, "record_keep_days")) rec.keep_days_ = yaml.GetValue<int>(sec, "record_keep_days");
+    if (yaml.HasValue(sec, "record_min_still")) rec.min_still_ = yaml.GetValue<double>(sec, "record_min_still");
 
     if (yaml.HasValue(sec, "map_save_interval")) {
         options_.map_save_interval_ = yaml.GetValue<double>(sec, "map_save_interval");
@@ -180,6 +184,7 @@ void LioSystem::Spin() {
 
 void LioSystem::ProcessIMU(const IMUPtr &imu) {
     num_imu_++;
+    UpdateImuStill(imu);
     lio_->ProcessIMU(imu);
 
     if (scan_waiting_) {
@@ -201,6 +206,32 @@ void LioSystem::ProcessIMU(const IMUPtr &imu) {
     extrapolation_warned_ = false;
 
     Publish(lio_->GetIMUState(), imu->angular_velocity, imu->timestamp);
+}
+
+void LioSystem::UpdateImuStill(const IMUPtr &imu) {
+    imu_window_.emplace_back(imu->timestamp, Vec2d(imu->linear_acceleration.norm(), imu->angular_velocity.norm()));
+    while (!imu_window_.empty() && imu->timestamp - imu_window_.front().first > 1.0) {
+        imu_window_.pop_front();
+    }
+
+    // 每 20 条（200 Hz 时 0.1 秒）算一次
+    if (num_imu_ % 20 != 0 || imu_window_.size() < 50) {
+        return;
+    }
+
+    double sum = 0, sum2 = 0, gyro_max = 0;
+    for (const auto &w : imu_window_) {
+        sum += w.second[0];
+        sum2 += w.second[0] * w.second[0];
+        gyro_max = std::max(gyro_max, w.second[1]);
+    }
+    const double n = imu_window_.size();
+    const double mean = sum / n;
+    const double acc_std = std::sqrt(std::max(0.0, sum2 / n - mean * mean));
+
+    // 加计单位可能是 g（livox）也可能是 m/s^2，阈值按均值换算
+    const double th = 0.004 * (mean > 5.0 ? 9.81 : 1.0);
+    imu_still_ = acc_std < th && gyro_max < 0.05;
 }
 
 void LioSystem::AfterLidar() {
@@ -227,7 +258,8 @@ void LioSystem::RunLIO() {
         interval_max_ms_ = std::max(interval_max_ms_, ms);
         last_lio_time_ = lio_->GetState().timestamp_;
         if (recorder_ && num_frames_ >= 2) {
-            recorder_->AddState(lio_->GetState());
+            // 刚初始化的几秒里程计还在收敛，不算静止漂移
+            recorder_->AddState(lio_->GetState(), imu_still_ && num_frames_ > 50);
         }
     }
 

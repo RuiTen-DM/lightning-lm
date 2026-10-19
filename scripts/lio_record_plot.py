@@ -6,9 +6,11 @@
     python3 scripts/lio_record_plot.py <记录目录> [-o lio_record.html]
 
 页面内容（按每次运行分开，默认最后一次；每次启动里程计从当时的位置重新开始，各次运行的坐标系不同）：
-    - 俯视图：局部地图（灰色，按高度深浅）、轨迹、停靠点
+    - 俯视图：局部地图（灰色，按高度深浅）、轨迹、停车位置
     - 沿轨道位置、高度随时间的变化
-    - 各停靠点相对第一次到达时的偏移随时间的变化（即漂移）
+    - 静止时的漂移：IMU 判断真正静止期间，里程计位置变了多少（still.csv）
+    - 来回一致性：轨道是固定的直线，每一趟经过同一沿轨道位置时，横向偏移和高度应该相同；
+      各趟相对最早经过该处那一趟的偏差随时间变大，就是漂移（航向漂移表现为离起点越远横向偏得越多）
     - CPU、内存、每帧耗时、局部地图格数、丢帧随时间的变化
 图上可以滚轮缩放、拖动平移、双击复原，鼠标悬停看数值。地址后加 #序号（从 0 开始）可以直接打开某次运行。
 """
@@ -120,15 +122,64 @@ def r2(a, d=2):
     return np.round(np.asarray(a, dtype=float), d).tolist()
 
 
-def main():
-    parser = argparse.ArgumentParser(description='把 run_lio_online 的记录画成 html')
-    parser.add_argument('dir')
-    parser.add_argument('-o', '--output', help='输出 html，默认 <记录目录>/lio_record.html')
-    parser.add_argument('--cluster', type=float, default=1.0, help='停靠点归类的距离（米）；漂移超过它时同一停靠点会被拆成相邻的两个')
-    args = parser.parse_args()
-    d = args.dir
-    out = args.output or os.path.join(d, 'lio_record.html')
+def read_still(path):
+    """still.csv：每段静止的起点、时长、起点位置、位移、航向变化、是否为该段最后一行"""
+    rows = []
+    if os.path.exists(path):
+        with open(path) as fh:
+            for r in csv.DictReader(fh):
+                rows.append([parse_local(r['start']), float(r['duration_s']), float(r['x0']), float(r['y0']),
+                             float(r['z0']), float(r['dx']), float(r['dy']), float(r['dz']), float(r['dyaw_deg']),
+                             float(r['final'])])
+    return np.array(rows) if rows else np.zeros((0, 10))
 
+
+def split_passes(t, along, min_len=10.0):
+    """把轨迹切成一趟一趟：相邻采样（约 1 秒）沿轨道走了 0.1 m 以上且方向相同，算同一趟；走过不到 min_len 米的不要"""
+    if len(t) < 3:
+        return []
+    ds, dt = np.diff(along), np.diff(t)
+    dirn = np.where((np.abs(ds) > 0.1) & (dt < 5), np.sign(ds), 0)
+    passes, i, n = [], 0, len(ds)
+    while i < n:
+        if dirn[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and dirn[j + 1] == dirn[i]:
+            j += 1
+        idx = np.arange(i, j + 2)
+        if abs(along[idx[-1]] - along[idx[0]]) >= min_len:
+            passes.append(idx)
+        i = j + 1
+    return passes
+
+
+def pass_consistency(t, along, lat, z, bin_size=2.0):
+    """每一趟在各个 2 m 格子里的横向、高度，减去最早经过这个格子的那一趟，取中位数"""
+    passes = split_passes(t, along)
+    ref, rows = {}, []
+    for idx in passes:
+        b = np.floor(along[idx] / bin_size).astype(int)
+        dl, dz, new = [], [], {}
+        for bi in np.unique(b):
+            m = b == bi
+            lv, zv = lat[idx][m].mean(), z[idx][m].mean()
+            if bi in ref:
+                dl.append(lv - ref[bi][0])
+                dz.append(zv - ref[bi][1])
+            else:
+                new[bi] = (lv, zv)
+        ref.update(new)
+        if dl:
+            rows.append({'t': float(t[idx].mean()), 'dl': float(np.median(dl)), 'dz': float(np.median(dz)),
+                         'n': len(dl), 'len': float(abs(along[idx[-1]] - along[idx[0]])),
+                         'dir': int(np.sign(along[idx[-1]] - along[idx[0]]))})
+    return passes, rows
+
+
+def analyze(d):
+    """读一个记录目录，按每次运行分开整理，供画图和文字汇总共用"""
     starts, status = read_status(os.path.join(d, 'status.csv'))
     if not starts:
         starts = [status[0, 0] if len(status) else 0.0]
@@ -146,12 +197,20 @@ def main():
             for r in csv.DictReader(fh):
                 stops.append([parse_local(r['time']), float(r['x']), float(r['y']), float(r['z']), float(r['path_m'])])
     stops = np.array(stops) if stops else np.zeros((0, 5))
+    still = read_still(os.path.join(d, 'still.csv'))
 
-    # 地图：local_map.pcd 属于最后一次运行，local_map_prev.pcd 属于上一次
+    # 地图属于哪次运行，按 local_map_pose*.txt 里记的存图时间判断（没收到数据的运行不会存图，不能按先后顺序猜）
     maps = {}
-    for name, sess in (('local_map.pcd', len(starts) - 1), ('local_map_prev.pcd', len(starts) - 2)):
-        p = os.path.join(d, name)
-        if os.path.exists(p) and sess >= 0:
+    for name, pose_name in (('local_map.pcd', 'local_map_pose.txt'), ('local_map_prev.pcd', 'local_map_pose_prev.txt')):
+        p, pp = os.path.join(d, name), os.path.join(d, pose_name)
+        if not (os.path.exists(p) and os.path.exists(pp)):
+            continue
+        lines = [ln for ln in open(pp) if ln.strip() and not ln.startswith('#')]
+        if not lines:
+            continue
+        saved = parse_local(' '.join(lines[-1].split()[:2]))
+        sess = max([i for i, t0 in enumerate(starts) if t0 <= saved], default=-1)
+        if sess >= 0 and sess not in maps:
             pts = read_pcd_xyz(p)
             # 俯视图只需要稀疏一些的点：0.5 m 格子里留最高的点
             key = np.floor(pts[:, :2] / 0.5).astype(np.int64)
@@ -165,74 +224,113 @@ def main():
     bounds = list(starts) + [float('inf')]
     for i in range(len(starts)):
         lo, hi = bounds[i], bounds[i + 1]
-        t = traj[(traj[:, 0] >= lo) & (traj[:, 0] < hi)] if len(traj) else traj
-        s = stops[(stops[:, 0] >= lo) & (stops[:, 0] < hi)] if len(stops) else stops
-        st = status[(status[:, 0] >= lo) & (status[:, 0] < hi)] if len(status) else status
+        pick = lambda a: a[(a[:, 0] >= lo) & (a[:, 0] < hi)] if len(a) else a
+        t, s, st, sl = pick(traj), pick(stops), pick(status), pick(still)
         if len(t) == 0 and len(st) == 0:
             continue
 
         # 沿轨道方向：轨迹水平位置的主方向
+        axis = np.array([0.0, 1.0])
         if len(t) > 2:
             xy = t[:, 1:3] - t[:, 1:3].mean(0)
             w, v = np.linalg.eigh(xy.T @ xy)
-            axis = v[:, 1]
-            if axis @ (t[-1, 1:3] - t[0, 1:3]) < 0 and np.ptp(xy @ axis) > 1:
-                axis = -axis
-        else:
-            axis = np.array([0.0, 1.0])
+            if w[1] > 1.0:  # 至少走过一段，主方向才可靠
+                axis = v[:, 1]
+                if axis @ (t[-1, 1:3] - t[0, 1:3]) < 0:
+                    axis = -axis
         lat = np.array([-axis[1], axis[0]])
 
-        # 停靠点归类，偏移相对第一次到达
-        clusters = []
-        for row in s:
-            for c in clusters:
-                if np.linalg.norm(c[0][1:3] - row[1:3]) < args.cluster:
-                    c.append(row)
-                    break
-            else:
-                clusters.append([row])
-        drift = []
-        for ci, c in enumerate(sorted(clusters, key=lambda c: c[0][0])):
-            c = np.array(c)
-            dxy = c[:, 1:3] - c[0, 1:3]
-            drift.append({'name': f'停靠点 {ci}（{c[0, 1]:.1f}, {c[0, 2]:.1f}），{len(c)} 次',
-                          't': r2(c[:, 0], 0), 'along': r2(dxy @ axis, 3), 'lat': r2(dxy @ lat, 3),
-                          'z': r2(c[:, 3] - c[0, 3], 3)})
+        along_t, lat_t = (t[:, 1:3] @ axis, t[:, 1:3] @ lat) if len(t) else (np.zeros(0), np.zeros(0))
+        passes, pass_rows = pass_consistency(t[:, 0], along_t, lat_t, t[:, 3]) if len(t) else ([], [])
 
-        td = decimate(t, 40000)
-        m = maps.get(i)
+        # 静止漂移：位移投到沿轨道 / 横向
+        if len(sl):
+            d_along, d_lat = sl[:, 5:7] @ axis, sl[:, 5:7] @ lat
+            d_norm = np.linalg.norm(sl[:, 5:8], axis=1)
+        else:
+            d_along = d_lat = d_norm = np.zeros(0)
+        final = sl[:, 9] > 0 if len(sl) else np.zeros(0, bool)
+        long_final = final & (sl[:, 1] >= 60) if len(sl) else final
+        rates = d_norm[long_final] / sl[long_final, 1] * 3600 if long_final.any() else np.zeros(0)
+
         sessions.append({
-            'label': f'第 {i + 1} 次运行（{datetime.fromtimestamp(starts[i]):%m-%d %H:%M} 启动）',
-            'start': starts[i],
+            'index': i, 'start': starts[i], 'axis': axis, 'lat': lat, 'traj': t, 'stops': s, 'status': st,
+            'still': sl, 'still_along': d_along, 'still_lat': d_lat, 'still_norm': d_norm, 'still_final': final,
+            'still_rates': rates, 'passes': passes, 'pass_rows': pass_rows, 'map': maps.get(i),
+            'along_t': along_t, 'lat_t': lat_t,
+        })
+    return starts, sessions
+
+
+def main():
+    parser = argparse.ArgumentParser(description='把 run_lio_online 的记录画成 html')
+    parser.add_argument('dir')
+    parser.add_argument('-o', '--output', help='输出 html，默认 <记录目录>/lio_record.html')
+    args = parser.parse_args()
+    d = args.dir
+    out = args.output or os.path.join(d, 'lio_record.html')
+
+    starts, sessions = analyze(d)
+    pages = []
+    for S in sessions:
+        t, s, st, sl, axis, lat = S['traj'], S['stops'], S['status'], S['still'], S['axis'], S['lat']
+        td_idx = np.linspace(0, len(t) - 1, min(len(t), 40000)).astype(int) if len(t) else []
+        td = t[td_idx] if len(t) else t
+        m = S['map']
+
+        # 剖面：最早和最近一趟（各自抽稀到 2000 点）
+        prof = []
+        if S['passes']:
+            chosen = [(0, '最早一趟')] + ([(len(S['passes']) - 1, '最近一趟')] if len(S['passes']) > 1 else [])
+            for k, name in chosen:
+                idx = S['passes'][k]
+                idx = idx[np.linspace(0, len(idx) - 1, min(len(idx), 2000)).astype(int)]
+                prof.append({'name': f'{name}（{datetime.fromtimestamp(t[idx[0], 0]):%m-%d %H:%M}）',
+                             'along': r2(S['along_t'][idx]), 'lat': r2(S['lat_t'][idx], 3), 'z': r2(t[idx, 3], 3)})
+
+        pr = S['pass_rows']
+        rates = S['still_rates']
+        pages.append({
+            'label': f'第 {S["index"] + 1} 次运行（{datetime.fromtimestamp(S["start"]):%m-%d %H:%M} 启动）',
             'traj': {'t': r2(td[:, 0], 1), 'x': r2(td[:, 1]), 'y': r2(td[:, 2]), 'z': r2(td[:, 3]),
                      'along': r2(td[:, 1:3] @ axis), 'lat': r2(td[:, 1:3] @ lat)} if len(td) else None,
             'stops': {'t': r2(s[:, 0], 0), 'x': r2(s[:, 1]), 'y': r2(s[:, 2]), 'z': r2(s[:, 3]),
                       'along': r2(s[:, 1:3] @ axis), 'lat': r2(s[:, 1:3] @ lat), 'path': r2(s[:, 4], 1)}
             if len(s) else None,
-            'drift': drift,
+            'still': {'t': r2(sl[:, 0] + sl[:, 1], 0), 'dur': r2(sl[:, 1], 0), 'along': r2(S['still_along'] * 100),
+                      'lat': r2(S['still_lat'] * 100), 'z': r2(sl[:, 7] * 100), 'yaw': r2(sl[:, 8], 3),
+                      'final': r2(sl[:, 9], 0)} if len(sl) else None,
+            'passdev': {'t': [r['t'] for r in pr], 'dl': [round(r['dl'] * 100, 1) for r in pr],
+                        'dz': [round(r['dz'] * 100, 1) for r in pr], 'n': [r['n'] for r in pr],
+                        'len': [round(r['len'], 1) for r in pr], 'dir': [r['dir'] for r in pr]} if pr else None,
+            'profiles': prof,
             'map': {'along': r2(m[0][:, :2] @ axis), 'lat': r2(m[0][:, :2] @ lat), 'z': r2(m[0][:, 2], 1),
                     'n': int(m[1])} if m else None,
             'status': {'t': r2(st[:, 0], 0), 'frames': r2(st[:, 1], 0), 'scans': r2(st[:, 2], 0),
                        'dropped': r2(st[:, 3], 0), 'lio_avg': r2(st[:, 4]), 'lio_max': r2(st[:, 5]),
                        'grids': r2(st[:, 6], 0), 'rss': r2(st[:, 7], 1), 'cpu': r2(st[:, 8], 0)} if len(st) else None,
             'stats': {
-                'hours': (st[-1, 0] - starts[i]) / 3600 if len(st) else 0,
+                'hours': (st[-1, 0] - S['start']) / 3600 if len(st) else 0,
                 'frames': int(st[-1, 1]) if len(st) else 0, 'scans': int(st[-1, 2]) if len(st) else 0,
                 'dropped': int(st[-1, 3]) if len(st) else 0,
                 'cpu_max': float(st[:, 8].max()) if len(st) else 0, 'rss_max': float(st[:, 7].max()) if len(st) else 0,
                 'lio_max': float(st[:, 5].max()) if len(st) else 0, 'grids': int(st[-1, 6]) if len(st) else 0,
                 'stops': int(len(s)), 'km': float(s[:, 4].sum() / 1000) if len(s) else 0,
+                'still_h': float(sl[S['still_final'], 1].sum() / 3600) if len(sl) else 0,
+                'still_rate': float(np.median(rates) * 100) if len(rates) else None,
+                'passes': len(S['passes']),
+                'last_dl': pr[-1]['dl'] * 100 if pr else None, 'last_dz': pr[-1]['dz'] * 100 if pr else None,
             },
         })
 
     meta = {'dir': os.path.abspath(d), 'generated': datetime.now().strftime('%Y-%m-%d %H:%M'),
             'sessions': len(starts)}
-    page = TEMPLATE.replace('__DATA__', json.dumps({'meta': meta, 'sessions': sessions}, ensure_ascii=False,
+    page = TEMPLATE.replace('__DATA__', json.dumps({'meta': meta, 'sessions': pages}, ensure_ascii=False,
                                                    separators=(',', ':')))
     page = page.replace('__TITLE__', html.escape(os.path.basename(os.path.abspath(d)) or '里程计记录'))
     with open(out, 'w') as f:
         f.write(page)
-    print(f'{out}  （{os.path.getsize(out) / 1024:.0f} KB，{len(sessions)} 次运行）')
+    print(f'{out}  （{os.path.getsize(out) / 1024:.0f} KB，{len(pages)} 次运行）')
 
 
 TEMPLATE = r'''<!doctype html>
@@ -296,9 +394,20 @@ canvas { width: 100%; display: block; touch-action: none; }
       <canvas id="along" height="240"></canvas></div>
     <div class="panel"><h2>高度</h2><div class="note">odom 系 z</div><canvas id="height" height="240"></canvas></div>
   </div>
-  <div class="panel"><h2>停靠点漂移</h2>
-    <div class="note">同一停靠点每次停稳的位置相对第一次的偏移（沿轨道 / 横向 / 高度）。来回跑时偏移随时间变大，就是里程计在漂</div>
-    <div class="legend" id="lg-drift"></div><canvas id="drift" height="260"></canvas></div>
+  <div class="panel"><h2>静止时的漂移</h2>
+    <div class="note">IMU 判断真正静止（加计 1 秒内的波动小于 4 mg）的每一段里，里程计位置变了多少，单位 cm。横轴是该段结束的时间；
+      大点是整段的结果，小点是长时间静止时每 10 分钟记一次的累计值。不依赖停车位置</div>
+    <div class="legend" id="lg-still"></div><canvas id="still" height="220"></canvas></div>
+  <div class="panel"><h2>来回一致性</h2>
+    <div class="note">轨道是固定的直线：每一趟经过同一沿轨道位置（2 m 一格）时，横向偏移和高度应该相同。
+      这里画每一趟相对最早经过那里的一趟的偏差（取中位数，单位 cm），随时间变大就是漂移。沿轨道方向本身的漂移从这里看不出来</div>
+    <div class="legend" id="lg-pass"></div><canvas id="passdev" height="220"></canvas></div>
+  <div class="grid2">
+    <div class="panel"><h2>横向剖面</h2><div class="note">横轴沿轨道位置，纵轴横向偏移，单位 m</div>
+      <div class="legend" id="lg-prof"></div><canvas id="prof_lat" height="200"></canvas></div>
+    <div class="panel"><h2>高度剖面</h2><div class="note">横轴沿轨道位置，纵轴高度，单位 m</div>
+      <div class="legend" id="lg-prof2"></div><canvas id="prof_z" height="200"></canvas></div>
+  </div>
   <div class="grid2">
     <div class="panel"><h2>CPU（占单核 %）</h2><canvas id="cpu" height="180"></canvas></div>
     <div class="panel"><h2>常驻内存（MB）</h2><canvas id="rss" height="180"></canvas></div>
@@ -462,7 +571,8 @@ class Chart {
 
 const charts = {};
 for (const [id, opt] of Object.entries({top: {equal: true}, along: {time: true, ylabel: 'm'}, height: {time: true, ylabel: 'm'},
-  drift: {time: true, ylabel: 'm'}, cpu: {time: true}, rss: {time: true}, lio: {time: true}, grids: {time: true}}))
+  still: {time: true, ylabel: 'cm'}, passdev: {time: true, ylabel: 'cm'}, prof_lat: {ylabel: 'm'}, prof_z: {ylabel: 'm'},
+  cpu: {time: true}, rss: {time: true}, lio: {time: true}, grids: {time: true}}))
   charts[id] = new Chart(id, opt);
 
 function legend(id, items) {
@@ -475,7 +585,10 @@ function show(idx) {
   document.getElementById('cards').innerHTML = [
     card('运行时长', st.hours.toFixed(st.hours < 10 ? 2 : 1) + ' 小时'),
     card('处理 / 收到帧', st.frames + ' / ' + st.scans), card('丢帧', st.dropped),
-    card('停稳次数', st.stops), card('走过路程', st.km.toFixed(2) + ' km'),
+    card('走过路程', st.km.toFixed(2) + ' km'), card('来回趟数', st.passes),
+    card('最近一趟偏差（横向 / 高度）', st.last_dl === null ? '-' : st.last_dl.toFixed(1) + ' / ' + st.last_dz.toFixed(1) + ' cm'),
+    card('静止总时长', st.still_h.toFixed(st.still_h < 10 ? 2 : 1) + ' 小时'),
+    card('静止漂移（中位）', st.still_rate === null ? '-' : st.still_rate.toFixed(1) + ' cm/小时'),
     card('局部地图', st.grids + ' 格'), card('最大 CPU', st.cpu_max.toFixed(0) + '%'),
     card('最大内存', st.rss_max.toFixed(0) + ' MB'), card('最大每帧耗时', st.lio_max.toFixed(0) + ' ms')].join('');
 
@@ -491,10 +604,10 @@ function show(idx) {
   }
   if (T) top.push({name: '轨迹', mode: 'line', x: T.along, y: T.lat, color: c0, width: 1.6, gap: 300,
     text: i => `${fmtFull(T.t[i])}\nx ${T.x[i]}  y ${T.y[i]}  z ${T.z[i]}`});
-  if (P) top.push({name: '停靠点', mode: 'dot', x: P.along, y: P.lat, color: cs, size: 7,
+  if (P) top.push({name: '停车位置', mode: 'dot', x: P.along, y: P.lat, color: cs, size: 7,
     text: i => `停稳 ${fmtFull(P.t[i])}\nx ${P.x[i]}  y ${P.y[i]}  z ${P.z[i]}\n这一段 ${P.path[i]} m`});
   charts.top.set(top);
-  legend('lg-top', [['轨迹', c0], ['停靠点', cs]].concat(M ? [['局部地图（按高度深浅）', cm]] : []));
+  legend('lg-top', [['轨迹', c0], ['停车位置', cs]].concat(M ? [['局部地图（按高度深浅）', cm]] : []));
   const frame = '横轴沿轨道、纵轴横向（轨迹的主方向，等比例），单位 m；悬停显示 odom 系 x y z';
   document.getElementById('mapnote').textContent = M ? `${frame}。局部地图 ${M.n} 点（显示 ${M.along.length} 个，每 0.5 m 取最高点）`
     : `${frame}。没有这次运行的局部地图（local_map.pcd）`;
@@ -505,15 +618,38 @@ function show(idx) {
   charts.height.set(T ? [{mode: 'line', x: T.t, y: T.z, color: c0, gap: 300,
     text: i => `${fmtFull(T.t[i])}\nz ${T.z[i]} m`}] : []);
 
-  const dr = [], lg = [], comp = [['沿轨道', 'along'], ['横向', 'lat'], ['高度', 'z']];
-  S.drift.filter(d => d.t.length > 1).slice(0, 6).forEach((d, k) => {
-    const col = css(PAL[k % PAL.length]);
-    comp.forEach(([cn, key], j) => dr.push({mode: j === 0 ? 'line' : 'dot', x: d.t, y: d[key], color: col,
-      size: [0, 6, 3][j], width: 1.8, text: i => `${d.name}\n${fmtFull(d.t[i])}\n${cn}偏移 ${d[key][i]} m`}));
-    lg.push([d.name, col]);
-  });
-  charts.drift.set(dr);
-  legend('lg-drift', lg.length ? lg.concat([['线：沿轨道；大点：横向；小点：高度', css('--muted')]]) : [['停稳次数还不够（同一停靠点至少两次）', css('--muted')]]);
+  // 静止漂移
+  const L = S.still, c1 = css('--c1'), c2 = css('--c2');
+  const still = [];
+  if (L) {
+    const pick = f => L.t.map((_, i) => i).filter(i => (L.final[i] > 0) === f);
+    for (const [f, size] of [[true, 7], [false, 3]]) {
+      const ix = pick(f);
+      [['沿轨道', 'along', c0], ['横向', 'lat', c1], ['高度', 'z', c2]].forEach(([name, key, col]) => still.push({
+        mode: 'dot', size, color: col, x: ix.map(i => L.t[i]), y: ix.map(i => L[key][i]),
+        text: k => { const i = ix[k]; return `静止 ${(L.dur[i] / 60).toFixed(1)} 分钟，到 ${fmtFull(L.t[i])}${f ? '' : '（累计中）'}\n` +
+          `沿轨道 ${L.along[i]}  横向 ${L.lat[i]}  高度 ${L.z[i]} cm\n航向 ${L.yaw[i]}°  ` +
+          `合计 ${(Math.hypot(L.along[i], L.lat[i], L.z[i]) / L.dur[i] * 3600).toFixed(1)} cm/小时`; }}));
+    }
+  }
+  charts.still.set(still);
+  legend('lg-still', L ? [['沿轨道', c0], ['横向', c1], ['高度', c2]] : [['还没有记录（still.csv，需要新版本程序；静止 30 秒以上才记）', css('--muted')]]);
+
+  // 来回一致性
+  const D = S.passdev;
+  charts.passdev.set(D ? [['横向', 'dl', c1], ['高度', 'dz', c2]].map(([name, key, col]) => ({mode: 'dot', size: 6, color: col,
+    x: D.t, y: D[key], text: i => `${fmtFull(D.t[i])} 这一趟（${D.dir[i] > 0 ? '正向' : '反向'}，${D.len[i]} m，` +
+      `和更早的趟重合 ${D.n[i] * 2} m）\n横向偏差 ${D.dl[i]} cm  高度偏差 ${D.dz[i]} cm`})) : []);
+  legend('lg-pass', D ? [['横向', c1], ['高度', c2]] : [['还没有两趟以上重合的轨迹（每趟至少 10 m）', css('--muted')]]);
+
+  // 剖面：最早和最近一趟
+  const PR = S.profiles, pc = [c0, c1];
+  charts.prof_lat.set(PR.map((p, k) => ({mode: 'line', x: p.along, y: p.lat, color: pc[k], width: 1.4,
+    text: i => `${p.name}\n沿轨道 ${p.along[i]} m  横向 ${p.lat[i]} m`})));
+  charts.prof_z.set(PR.map((p, k) => ({mode: 'line', x: p.along, y: p.z, color: pc[k], width: 1.4,
+    text: i => `${p.name}\n沿轨道 ${p.along[i]} m  高度 ${p.z[i]} m`})));
+  legend('lg-prof', PR.length ? PR.map((p, k) => [p.name, pc[k]]) : [['还没有完整的一趟（至少 10 m）', css('--muted')]]);
+  legend('lg-prof2', PR.map((p, k) => [p.name, pc[k]]));
 
   const ts = (key, col, name) => Q ? {mode: 'line', x: Q.t, y: Q[key], color: col, gap: 600,
     text: i => `${fmtFull(Q.t[i])}\n${name} ${Q[key][i]}`} : null;

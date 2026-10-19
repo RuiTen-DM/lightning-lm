@@ -1,0 +1,18 @@
+# systemd 用户服务，放到 ~/.config/systemd/user/ 下，然后
+#   systemctl --user daemon-reload && systemctl --user enable --now lightning-lio
+# 用户服务在用户登录后才启动：设备要开自动登录，或者 sudo loginctl enable-linger <用户>
+[Unit]
+Description=lightning-lm continuous LIO odometry (run_lio_online)
+
+[Service]
+Type=simple
+ExecStart=%h/lightning_lio/run.sh
+Restart=always
+RestartSec=10
+# 优先级低于现场的其他程序；内存超限只杀它自己
+Nice=10
+MemoryMax=1G
+Environment=ROS_DOMAIN_ID=0
+
+[Install]
+WantedBy=default.target
