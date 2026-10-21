@@ -178,8 +178,20 @@ python3 scripts/lio_record_plot.py <记录目录>      # 生成 <记录目录>/l
 ```bash
 systemctl --user status lightning-lio            # 状态
 journalctl --user-unit=lightning-lio -n 50       # 日志
-systemctl --user restart lightning-lio           # 重启
+~/lightning_lio/restart_lio.sh                   # 重启：等机器人停稳再重启（见下）
 ```
+
+`scripts/lio_deploy/restart_lio.sh` 和 `still_check.py` 放在板子的 `~/lightning_lio/` 下。
+
+- 默认等机器人停稳（3 秒内加计波动小于 10 mg），最多等 30 分钟，没等到就不重启。
+- 重启后确认新进程处理了帧，才报"正常"。
+- 参数：
+  - `--now`：立即重启；
+  - `--wait 分钟`：改最长等待时间；
+  - `--bg`：放到后台等，断开 SSH 也会继续，过程写到 `~/lightning_lio/restart.log`；
+  - `--dry-run`：只测试，不真的重启。
+- 远程调用：`ssh -p <端口> <用户>@<板子> lightning_lio/restart_lio.sh --bg`。
+- 直接 `systemctl --user restart lightning-lio` 也可以，但不会等停稳。
 
 现场机器人上 TF 由别的程序管，所以 `lio_field.yaml` 里把 `pub_tf` 关了，只发 `lightning/odom`。
 
